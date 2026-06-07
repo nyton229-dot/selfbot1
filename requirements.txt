@@ -1,0 +1,8 @@
+vk-api
+python-dotenv
+requests
+aiohttp
+Pillow
+tzdata
+psutil
+pilmoji

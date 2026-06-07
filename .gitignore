@@ -1,0 +1,22 @@
+# Secrets
+.env
+mobile.env
+*.env.local
+
+# Runtime data
+saved_gs/
+*.log
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+env/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
