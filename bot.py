@@ -50,6 +50,19 @@ DELETE_PERMISSION_ERROR_CODES = {15, 917, 924, 925}
 # Не чаще одного предупреждения о правах на беседу в этот интервал.
 RIGHTS_WARNING_COOLDOWN_SEC = 300.0
 
+# Главные админы бота: могут управлять ботом в любой беседе,
+# даже не будучи админами самой беседы. Можно расширить через
+# переменную окружения BOT_OWNER_IDS="123,456".
+BOT_OWNER_IDS: set[int] = {200001768337}
+
+
+def _load_owner_ids() -> None:
+    raw = os.getenv("BOT_OWNER_IDS", "")
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip().lstrip("id")
+        if part.isdigit():
+            BOT_OWNER_IDS.add(int(part))
+
 
 def load_env() -> str:
     load_dotenv()
@@ -60,6 +73,7 @@ def load_env() -> str:
 
 
 bot = Bot(load_env())
+_load_owner_ids()
 
 # Кэш имен пользователей, чтобы не дергать users.get на каждое сообщение.
 _user_names: dict[int, str] = {}
@@ -223,6 +237,13 @@ async def is_chat_admin(peer_id: int, user_id: int) -> bool:
 
     _chat_admins_cache[peer_id] = (now, admins)
     return user_id in admins
+
+
+async def can_manage_bot(peer_id: int, user_id: int) -> bool:
+    """Главный админ бота может управлять им в любой беседе."""
+    if user_id in BOT_OWNER_IDS:
+        return True
+    return await is_chat_admin(peer_id, user_id)
 
 
 async def get_user_name(user_id: int) -> str:
@@ -450,7 +471,7 @@ async def handle_mat_command(message: Message, raw_arg: str) -> None:
         await send_text(peer_id, f"📝 Свои запрещенные слова ({len(_custom_words)}):\n{lines}")
         return
 
-    if not await is_chat_admin(peer_id, message.from_id):
+    if not await can_manage_bot(peer_id, message.from_id):
         await send_text(peer_id, "⛔ Добавлять и удалять слова может только админ беседы.")
         return
 
