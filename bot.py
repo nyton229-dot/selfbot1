@@ -24,7 +24,12 @@ import re
 import time
 
 from dotenv import load_dotenv
-from vkbottle import VKAPIError
+from vkbottle import (
+    DocMessagesUploader,
+    PhotoMessageUploader,
+    VKAPIError,
+    VoiceMessageUploader,
+)
 from vkbottle.bot import Bot, Message
 
 from profanity_filter import contains_profanity, text_core
@@ -270,32 +275,12 @@ async def send_text(
             raise
 
 
-# Типы вложений, которые можно переслать строкой type{owner}_{id}_{access_key}.
-RESENDABLE_ATTACHMENT_TYPES = {
-    "photo", "video", "doc", "audio", "audio_message", "graffiti", "wall",
-}
-
-
-def build_attachment_strings(message: Message) -> list[str]:
-    """Собирает строки вложений сообщения для повторной отправки."""
-    result: list[str] = []
-    for att in getattr(message, "attachments", None) or []:
-        att_type = getattr(att.type, "value", None) or str(att.type)
-        if att_type not in RESENDABLE_ATTACHMENT_TYPES:
-            continue
-        obj = getattr(att, att_type, None)
-        if obj is None:
-            continue
-        owner_id = getattr(obj, "owner_id", None) or getattr(obj, "to_id", None)
-        obj_id = getattr(obj, "id", None)
-        if not isinstance(owner_id, int) or not isinstance(obj_id, int):
-            continue
-        item = f"{att_type}{owner_id}_{obj_id}"
-        access_key = getattr(obj, "access_key", None)
-        if access_key:
-            item += f"_{access_key}"
-        result.append(item)
-    return result
+# Загрузчики vkbottle: заливают файлы от имени группы и возвращают строку
+# вложения. Нужны, потому что чужие фото/файлы по строке type{owner}_{id}
+# VK у ботов сообществ молча выбрасывает.
+_photo_uploader = PhotoMessageUploader(bot.api)
+_doc_uploader = DocMessagesUploader(bot.api)
+_voice_uploader = VoiceMessageUploader(bot.api)
 
 
 def _largest_photo_url(photo) -> str | None:
@@ -309,40 +294,56 @@ def _largest_photo_url(photo) -> str | None:
     return best_url
 
 
-async def reupload_photos(message: Message, peer_id: int) -> list[str]:
-    """Фолбэк: скачивает фото из сообщения и заливает их от имени группы."""
-    from aiohttp import FormData
+async def _download(url: str) -> bytes:
+    return await bot.api.http_client.request_content(url)
 
-    uploaded: list[str] = []
+
+async def build_repost_attachments(message: Message, peer_id: int) -> tuple[list[str], list[str]]:
+    """Готовит вложения для пересылки.
+
+    Возвращает (строки вложений, дополнительные строки текста).
+    Фото, документы и голосовые перезаливаются от имени группы; видео боты
+    загружать не могут, поэтому оно уходит ссылкой (VK развернет ее в плеер).
+    """
+    strings: list[str] = []
+    extra_lines: list[str] = []
     for att in getattr(message, "attachments", None) or []:
         att_type = getattr(att.type, "value", None) or str(att.type)
-        if att_type != "photo" or att.photo is None:
-            continue
-        url = _largest_photo_url(att.photo)
-        if not url:
-            continue
         try:
-            content = await bot.api.http_client.request_content(url)
-            server = await bot.api.photos.get_messages_upload_server(peer_id=peer_id)
-            form = FormData()
-            form.add_field("photo", content, filename="photo.jpg", content_type="image/jpeg")
-            upload_result = await bot.api.http_client.request_json(
-                server.upload_url, method="POST", data=form,
-            )
-            saved = await bot.api.photos.save_messages_photo(
-                photo=upload_result["photo"],
-                server=upload_result["server"],
-                hash=upload_result["hash"],
-            )
-            if saved:
-                photo = saved[0]
-                item = f"photo{photo.owner_id}_{photo.id}"
-                if getattr(photo, "access_key", None):
-                    item += f"_{photo.access_key}"
-                uploaded.append(item)
+            if att_type == "photo" and att.photo is not None:
+                url = _largest_photo_url(att.photo)
+                if url:
+                    strings.append(await _photo_uploader.upload(await _download(url), peer_id=peer_id))
+            elif att_type == "doc" and att.doc is not None:
+                doc_url = getattr(att.doc, "url", None)
+                if doc_url:
+                    title = getattr(att.doc, "title", None) or "file"
+                    strings.append(await _doc_uploader.upload(
+                        await _download(doc_url), peer_id=peer_id, title=title,
+                    ))
+            elif att_type == "audio_message" and att.audio_message is not None:
+                link = getattr(att.audio_message, "link_ogg", None) or getattr(att.audio_message, "link_mp3", None)
+                if link:
+                    strings.append(await _voice_uploader.upload(await _download(link), peer_id=peer_id))
+            elif att_type == "video" and att.video is not None:
+                owner_id = getattr(att.video, "owner_id", None)
+                video_id = getattr(att.video, "id", None)
+                if isinstance(owner_id, int) and isinstance(video_id, int):
+                    extra_lines.append(f"🎬 Видео: https://vk.com/video{owner_id}_{video_id}")
+            elif att_type == "audio" and att.audio is not None:
+                artist = getattr(att.audio, "artist", "") or ""
+                title = getattr(att.audio, "title", "") or ""
+                label = " — ".join(part for part in (artist, title) if part)
+                if label:
+                    extra_lines.append(f"🎵 Аудио: {label}")
+            elif att_type == "wall" and att.wall is not None:
+                owner_id = getattr(att.wall, "owner_id", None) or getattr(att.wall, "to_id", None)
+                post_id = getattr(att.wall, "id", None)
+                if isinstance(owner_id, int) and isinstance(post_id, int):
+                    extra_lines.append(f"📌 Пост: https://vk.com/wall{owner_id}_{post_id}")
         except Exception as exc:
-            logger.warning("Не удалось перезалить фото: %s", exc)
-    return uploaded
+            logger.warning("Не удалось обработать вложение %s: %s", att_type, exc)
+    return strings, extra_lines
 
 
 async def delete_message(message: Message) -> bool:
@@ -506,8 +507,11 @@ async def moderate_message(message: Message) -> None:
         # Обычное сообщение — не трогаем.
         return
 
+    raw_attachments = getattr(message, "attachments", None) or []
+    att_types = [getattr(a.type, "value", None) or str(a.type) for a in raw_attachments]
     logger.info(
-        "Мат в peer %s от id%s: %r", message.peer_id, message.from_id, text[:120]
+        "Мат в peer %s от id%s (вложения: %s): %r",
+        message.peer_id, message.from_id, att_types or "нет", text[:120],
     )
 
     deleted = await delete_message(message)
@@ -526,42 +530,33 @@ async def moderate_message(message: Message) -> None:
         if isinstance(cmid, int):
             reply_to_cmid = cmid
 
+    attachments, extra_lines = await build_repost_attachments(message, message.peer_id)
     repost_text = f"{author_link}: {text}"
-    attachments = build_attachment_strings(message)
-
-    # Сначала пробуем с исходными вложениями, потом перезаливаем фото,
-    # в крайнем случае шлем только текст.
+    if extra_lines:
+        repost_text += "\n" + "\n".join(extra_lines)
     if attachments:
-        try:
-            await send_text(
-                message.peer_id, repost_text,
-                reply_to_cmid=reply_to_cmid,
-                attachment=",".join(attachments),
-            )
-            return
-        except VKAPIError as exc:
-            logger.warning(
-                "Не удалось переслать с исходными вложениями (%s), пробую перезалить фото",
-                exc,
-            )
-            reuploaded = await reupload_photos(message, message.peer_id)
-            if reuploaded:
-                try:
-                    await send_text(
-                        message.peer_id, repost_text,
-                        reply_to_cmid=reply_to_cmid,
-                        attachment=",".join(reuploaded),
-                    )
-                    return
-                except VKAPIError as retry_exc:
-                    logger.warning("Не удалось переслать с перезалитыми фото: %s", retry_exc)
+        logger.info("Пересылаю с вложениями: %s", ",".join(attachments))
 
     try:
-        await send_text(message.peer_id, repost_text, reply_to_cmid=reply_to_cmid)
-    except VKAPIError as exc:
-        logger.error(
-            "Не удалось отправить копию сообщения в peer %s: %s", message.peer_id, exc
+        await send_text(
+            message.peer_id, repost_text,
+            reply_to_cmid=reply_to_cmid,
+            attachment=",".join(attachments) if attachments else None,
         )
+    except VKAPIError as exc:
+        if not attachments:
+            logger.error(
+                "Не удалось отправить копию сообщения в peer %s: %s", message.peer_id, exc
+            )
+            return
+        logger.warning("Не удалось отправить с вложениями (%s), шлю текст", exc)
+        try:
+            await send_text(message.peer_id, repost_text, reply_to_cmid=reply_to_cmid)
+        except VKAPIError as retry_exc:
+            logger.error(
+                "Не удалось отправить копию сообщения в peer %s: %s",
+                message.peer_id, retry_exc,
+            )
 
 
 def main() -> None:
