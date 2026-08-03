@@ -234,7 +234,12 @@ async def get_user_name(user_id: int) -> str:
     return name
 
 
-async def send_text(peer_id: int, text: str, reply_to_cmid: int | None = None) -> None:
+async def send_text(
+    peer_id: int,
+    text: str,
+    reply_to_cmid: int | None = None,
+    attachment: str | None = None,
+) -> None:
     params = dict(
         peer_id=peer_id,
         message=text,
@@ -242,6 +247,8 @@ async def send_text(peer_id: int, text: str, reply_to_cmid: int | None = None) -
         # Упоминание остается кликабельной ссылкой, но не пингует человека.
         disable_mentions=True,
     )
+    if attachment:
+        params["attachment"] = attachment
     if reply_to_cmid is not None:
         # Реплей по conversation_message_id — штатный способ для ботов сообществ.
         params["forward"] = json.dumps({
@@ -258,9 +265,84 @@ async def send_text(peer_id: int, text: str, reply_to_cmid: int | None = None) -
                 "Не удалось ответить реплеем на cmid=%s (%s), отправляю без реплея",
                 reply_to_cmid, exc,
             )
-            await send_text(peer_id, text)
+            await send_text(peer_id, text, attachment=attachment)
         else:
             raise
+
+
+# Типы вложений, которые можно переслать строкой type{owner}_{id}_{access_key}.
+RESENDABLE_ATTACHMENT_TYPES = {
+    "photo", "video", "doc", "audio", "audio_message", "graffiti", "wall",
+}
+
+
+def build_attachment_strings(message: Message) -> list[str]:
+    """Собирает строки вложений сообщения для повторной отправки."""
+    result: list[str] = []
+    for att in getattr(message, "attachments", None) or []:
+        att_type = getattr(att.type, "value", None) or str(att.type)
+        if att_type not in RESENDABLE_ATTACHMENT_TYPES:
+            continue
+        obj = getattr(att, att_type, None)
+        if obj is None:
+            continue
+        owner_id = getattr(obj, "owner_id", None) or getattr(obj, "to_id", None)
+        obj_id = getattr(obj, "id", None)
+        if not isinstance(owner_id, int) or not isinstance(obj_id, int):
+            continue
+        item = f"{att_type}{owner_id}_{obj_id}"
+        access_key = getattr(obj, "access_key", None)
+        if access_key:
+            item += f"_{access_key}"
+        result.append(item)
+    return result
+
+
+def _largest_photo_url(photo) -> str | None:
+    sizes = getattr(photo, "sizes", None) or []
+    best_url, best_area = None, -1
+    for size in sizes:
+        url = getattr(size, "url", None)
+        area = (getattr(size, "width", 0) or 0) * (getattr(size, "height", 0) or 0)
+        if url and area >= best_area:
+            best_url, best_area = url, area
+    return best_url
+
+
+async def reupload_photos(message: Message, peer_id: int) -> list[str]:
+    """Фолбэк: скачивает фото из сообщения и заливает их от имени группы."""
+    from aiohttp import FormData
+
+    uploaded: list[str] = []
+    for att in getattr(message, "attachments", None) or []:
+        att_type = getattr(att.type, "value", None) or str(att.type)
+        if att_type != "photo" or att.photo is None:
+            continue
+        url = _largest_photo_url(att.photo)
+        if not url:
+            continue
+        try:
+            content = await bot.api.http_client.request_content(url)
+            server = await bot.api.photos.get_messages_upload_server(peer_id=peer_id)
+            form = FormData()
+            form.add_field("photo", content, filename="photo.jpg", content_type="image/jpeg")
+            upload_result = await bot.api.http_client.request_json(
+                server.upload_url, method="POST", data=form,
+            )
+            saved = await bot.api.photos.save_messages_photo(
+                photo=upload_result["photo"],
+                server=upload_result["server"],
+                hash=upload_result["hash"],
+            )
+            if saved:
+                photo = saved[0]
+                item = f"photo{photo.owner_id}_{photo.id}"
+                if getattr(photo, "access_key", None):
+                    item += f"_{photo.access_key}"
+                uploaded.append(item)
+        except Exception as exc:
+            logger.warning("Не удалось перезалить фото: %s", exc)
+    return uploaded
 
 
 async def delete_message(message: Message) -> bool:
@@ -443,8 +525,39 @@ async def moderate_message(message: Message) -> None:
         cmid = getattr(replied, "conversation_message_id", None)
         if isinstance(cmid, int):
             reply_to_cmid = cmid
+
+    repost_text = f"{author_link}: {text}"
+    attachments = build_attachment_strings(message)
+
+    # Сначала пробуем с исходными вложениями, потом перезаливаем фото,
+    # в крайнем случае шлем только текст.
+    if attachments:
+        try:
+            await send_text(
+                message.peer_id, repost_text,
+                reply_to_cmid=reply_to_cmid,
+                attachment=",".join(attachments),
+            )
+            return
+        except VKAPIError as exc:
+            logger.warning(
+                "Не удалось переслать с исходными вложениями (%s), пробую перезалить фото",
+                exc,
+            )
+            reuploaded = await reupload_photos(message, message.peer_id)
+            if reuploaded:
+                try:
+                    await send_text(
+                        message.peer_id, repost_text,
+                        reply_to_cmid=reply_to_cmid,
+                        attachment=",".join(reuploaded),
+                    )
+                    return
+                except VKAPIError as retry_exc:
+                    logger.warning("Не удалось переслать с перезалитыми фото: %s", retry_exc)
+
     try:
-        await send_text(message.peer_id, f"{author_link}: {text}", reply_to_cmid=reply_to_cmid)
+        await send_text(message.peer_id, repost_text, reply_to_cmid=reply_to_cmid)
     except VKAPIError as exc:
         logger.error(
             "Не удалось отправить копию сообщения в peer %s: %s", message.peer_id, exc
