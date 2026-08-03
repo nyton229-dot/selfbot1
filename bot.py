@@ -166,7 +166,7 @@ async def moderate_message(message: Message) -> None:
 
 def main() -> None:
     logger.info("Бот-фильтр мата запущен и слушает сообщения...")
-    bot.run_forever()
+    bot.run()
 
 
 if __name__ == "__main__":
