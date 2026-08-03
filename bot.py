@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
+import re
 import time
 
 from dotenv import load_dotenv
@@ -58,6 +60,61 @@ bot = Bot(load_env())
 _user_names: dict[int, str] = {}
 # Когда мы в последний раз жаловались на отсутствие прав в конкретной беседе.
 _last_rights_warning: dict[int, float] = {}
+
+# --- Ники ---------------------------------------------------------------
+
+NICKNAMES_PATH = os.path.join(os.path.dirname(__file__), "nicknames.json")
+NICKNAME_MAX_LEN = 48
+
+
+def _load_nicknames() -> dict[str, str]:
+    try:
+        with open(NICKNAMES_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Не удалось прочитать %s: %s", NICKNAMES_PATH, exc)
+        return {}
+
+
+_nicknames: dict[str, str] = _load_nicknames()
+
+
+def _save_nicknames() -> None:
+    try:
+        with open(NICKNAMES_PATH, "w", encoding="utf-8") as f:
+            json.dump(_nicknames, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logger.error("Не удалось сохранить %s: %s", NICKNAMES_PATH, exc)
+
+
+def _nick_key(peer_id: int, user_id: int) -> str:
+    return f"{peer_id}:{user_id}"
+
+
+def get_nickname(peer_id: int, user_id: int) -> str | None:
+    return _nicknames.get(_nick_key(peer_id, user_id))
+
+
+def set_nickname(peer_id: int, user_id: int, nick: str) -> None:
+    _nicknames[_nick_key(peer_id, user_id)] = nick
+    _save_nicknames()
+
+
+def clear_nickname(peer_id: int, user_id: int) -> bool:
+    if _nicknames.pop(_nick_key(peer_id, user_id), None) is not None:
+        _save_nicknames()
+        return True
+    return False
+
+
+def sanitize_nickname(raw: str) -> str:
+    # Убираем символы разметки упоминаний VK, чтобы не ломать ссылку [id|ник].
+    nick = raw.replace("[", "").replace("]", "").replace("|", "")
+    nick = re.sub(r"\s+", " ", nick).strip()
+    return nick[:NICKNAME_MAX_LEN].strip()
 
 
 async def get_user_name(user_id: int) -> str:
@@ -130,6 +187,41 @@ async def warn_about_rights(peer_id: int) -> None:
         logger.error("Не удалось отправить предупреждение в peer %s: %s", peer_id, exc)
 
 
+async def handle_nick_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    user_id = message.from_id
+
+    if not raw_arg.strip():
+        current = get_nickname(peer_id, user_id)
+        hint = f"Твой текущий ник: {current}\n" if current else ""
+        await send_text(
+            peer_id,
+            f"{hint}✏️ Используй: !ник <новый ник>\n"
+            "Сбросить: !ник сброс",
+        )
+        return
+
+    if raw_arg.strip().lower() in {"сброс", "удалить", "reset"}:
+        real_name = await get_user_name(user_id)
+        if clear_nickname(peer_id, user_id):
+            await send_text(peer_id, f"✅ Ник сброшен. Теперь ты снова {real_name}.")
+        else:
+            await send_text(peer_id, f"У тебя и не было ника, ты {real_name}.")
+        return
+
+    nick = sanitize_nickname(raw_arg)
+    if not nick:
+        await send_text(peer_id, "❌ Такой ник не подойдет, попробуй другой.")
+        return
+
+    if contains_profanity(nick):
+        await send_text(peer_id, "❌ Ник с матом нельзя. Придумай другой.")
+        return
+
+    set_nickname(peer_id, user_id, nick)
+    await send_text(peer_id, f"✅ Готово! Теперь ты [id{user_id}|{nick}].")
+
+
 @bot.on.message()
 async def moderate_message(message: Message) -> None:
     logger.debug(
@@ -149,6 +241,12 @@ async def moderate_message(message: Message) -> None:
     if not text.strip():
         return
 
+    # Команда "!ник <новый ник>" — сменить отображаемое имя в пересылках.
+    parts = text.split(maxsplit=1)
+    if parts and parts[0].lower() in {"!ник", "!nick"}:
+        await handle_nick_command(message, parts[1] if len(parts) > 1 else "")
+        return
+
     if not contains_profanity(text):
         # Обычное сообщение — не трогаем.
         return
@@ -162,8 +260,8 @@ async def moderate_message(message: Message) -> None:
         return
 
     # Пересылаем оригинальный текст без цензуры. Имя автора — кликабельная
-    # ссылка на его профиль: [id123|Имя Фамилия].
-    author_name = await get_user_name(message.from_id)
+    # ссылка на его профиль: [id123|Имя Фамилия] (или установленный !ник).
+    author_name = get_nickname(message.peer_id, message.from_id) or await get_user_name(message.from_id)
     author_link = f"[id{message.from_id}|{author_name}]"
     try:
         await send_text(message.peer_id, f"{author_link}: {text}")
