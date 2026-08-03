@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+nicknames.json
+custom_words.json
+.vkbottle/
