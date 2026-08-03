@@ -5,4 +5,5 @@ __pycache__/
 venv/
 nicknames.json
 custom_words.json
+stats.json
 .vkbottle/

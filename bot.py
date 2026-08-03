@@ -209,6 +209,57 @@ def matches_custom_word(text: str) -> bool:
     return any(word_core and word_core in core for word_core in _custom_cores.values())
 
 
+# --- Статистика участников (анкета «Профиль») ------------------------------
+
+STATS_PATH = os.path.join(DATA_DIR, "stats.json")
+# Чтобы не писать на диск на каждое сообщение, сохраняем не чаще раза в N сек.
+STATS_SAVE_INTERVAL_SEC = 30.0
+
+
+def _load_stats() -> dict[str, dict]:
+    try:
+        with open(STATS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Не удалось прочитать %s: %s", STATS_PATH, exc)
+        return {}
+
+
+_stats: dict[str, dict] = _load_stats()
+_stats_last_save = 0.0
+
+
+def _save_stats(force: bool = False) -> None:
+    global _stats_last_save
+    now = time.monotonic()
+    if not force and now - _stats_last_save < STATS_SAVE_INTERVAL_SEC:
+        return
+    _stats_last_save = now
+    try:
+        _save_json(STATS_PATH, _stats)
+    except Exception as exc:
+        logger.error("Не удалось сохранить %s: %s", STATS_PATH, exc)
+
+
+def record_message_stat(peer_id: int, user_id: int) -> None:
+    entry = _stats.setdefault(
+        _nick_key(peer_id, user_id), {"msgs": 0, "viol": 0, "first": time.time()}
+    )
+    entry["msgs"] = entry.get("msgs", 0) + 1
+    _save_stats()
+
+
+def record_violation_stat(peer_id: int, user_id: int) -> None:
+    entry = _stats.setdefault(
+        _nick_key(peer_id, user_id), {"msgs": 0, "viol": 0, "first": time.time()}
+    )
+    entry["viol"] = entry.get("viol", 0) + 1
+    _save_stats(force=True)
+
+
 # --- Проверка прав администратора беседы -----------------------------------
 
 _chat_admins_cache: dict[int, tuple[float, set[int]]] = {}
@@ -494,6 +545,51 @@ async def handle_mat_command(message: Message, raw_arg: str) -> None:
         await send_text(peer_id, f"ℹ️ Это слово уже в списке: {word}")
 
 
+async def handle_profile_command(message: Message) -> None:
+    """«Профиль» — анкета участника беседы.
+
+    Если команда отправлена реплеем на чужое сообщение — показывает анкету
+    того пользователя, иначе — свою.
+    """
+    peer_id = message.peer_id
+    target_id = message.from_id
+    replied = getattr(message, "reply_message", None)
+    if replied is not None and getattr(replied, "from_id", 0) > 0:
+        target_id = replied.from_id
+
+    name = await get_user_name(target_id)
+    nick = get_nickname(peer_id, target_id)
+
+    if target_id in BOT_OWNER_IDS:
+        role = "👑 Главный админ бота"
+    elif await is_chat_admin(peer_id, target_id):
+        role = "⭐ Админ беседы"
+    else:
+        role = "👤 Участник"
+
+    entry = _stats.get(_nick_key(peer_id, target_id)) or {}
+    msgs = entry.get("msgs", 0)
+    viol = entry.get("viol", 0)
+    first = entry.get("first")
+    since = time.strftime("%d.%m.%Y", time.localtime(first)) if first else "—"
+
+    lines = [
+        "📋 Анкета участника",
+        "➖➖➖➖➖➖➖➖➖➖",
+        f"👤 Имя: [id{target_id}|{name}]",
+    ]
+    if nick:
+        lines.append(f"✏️ Ник в беседе: {nick}")
+    lines += [
+        f"🆔 Айди: id{target_id}",
+        f"🎖 Роль: {role}",
+        f"💬 Сообщений: {msgs}",
+        f"🤬 Удалено за мат: {viol}",
+        f"📅 Первое сообщение: {since}",
+    ]
+    await send_text(peer_id, "\n".join(lines))
+
+
 async def handle_admin_info_command(message: Message) -> None:
     """!н — показать, кто администратор бота, со ссылкой для связи."""
     lines = []
@@ -527,6 +623,8 @@ async def moderate_message(message: Message) -> None:
     if not text.strip():
         return
 
+    record_message_stat(message.peer_id, message.from_id)
+
     # Команды бота.
     parts = text.split(maxsplit=1)
     command = parts[0].lower() if parts else ""
@@ -539,6 +637,11 @@ async def moderate_message(message: Message) -> None:
         return
     if command in {"!н", "!n"}:
         await handle_admin_info_command(message)
+        return
+    # Анкету показываем, только если сообщение состоит из одной команды,
+    # чтобы не срабатывать на обычные фразы со словом «профиль».
+    if command in {"профиль", "!профиль", "анкета", "!анкета", "profile"} and not command_arg:
+        await handle_profile_command(message)
         return
 
     if not contains_profanity(text) and not matches_custom_word(text):
@@ -555,6 +658,8 @@ async def moderate_message(message: Message) -> None:
     deleted = await delete_message(message)
     if not deleted:
         return
+
+    record_violation_stat(message.peer_id, message.from_id)
 
     # Пересылаем оригинальный текст без цензуры. Имя автора — кликабельная
     # ссылка на его профиль: [id123|Имя Фамилия] (или установленный !ник).
