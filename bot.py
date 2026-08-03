@@ -61,9 +61,25 @@ _user_names: dict[int, str] = {}
 # Когда мы в последний раз жаловались на отсутствие прав в конкретной беседе.
 _last_rights_warning: dict[int, float] = {}
 
+# --- Хранилище данных бота ------------------------------------------------
+
+# Папку с данными можно вынести (например, тесты используют временную,
+# чтобы не трогать файлы живого бота).
+DATA_DIR = os.getenv("BOT_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _save_json(path: str, data) -> None:
+    """Атомарная запись: сначала во временный файл, потом rename."""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
 # --- Ники ---------------------------------------------------------------
 
-NICKNAMES_PATH = os.path.join(os.path.dirname(__file__), "nicknames.json")
+NICKNAMES_PATH = os.path.join(DATA_DIR, "nicknames.json")
 NICKNAME_MAX_LEN = 48
 
 
@@ -84,8 +100,7 @@ _nicknames: dict[str, str] = _load_nicknames()
 
 def _save_nicknames() -> None:
     try:
-        with open(NICKNAMES_PATH, "w", encoding="utf-8") as f:
-            json.dump(_nicknames, f, ensure_ascii=False, indent=2)
+        _save_json(NICKNAMES_PATH, _nicknames)
     except Exception as exc:
         logger.error("Не удалось сохранить %s: %s", NICKNAMES_PATH, exc)
 
@@ -119,7 +134,7 @@ def sanitize_nickname(raw: str) -> str:
 
 # --- Свой список запрещенных слов (!мат) ----------------------------------
 
-CUSTOM_WORDS_PATH = os.path.join(os.path.dirname(__file__), "custom_words.json")
+CUSTOM_WORDS_PATH = os.path.join(DATA_DIR, "custom_words.json")
 CUSTOM_WORD_MIN_CORE_LEN = 3
 
 
@@ -142,8 +157,7 @@ _custom_cores: dict[str, str] = {w: text_core(w) for w in _custom_words}
 
 def _save_custom_words() -> None:
     try:
-        with open(CUSTOM_WORDS_PATH, "w", encoding="utf-8") as f:
-            json.dump(_custom_words, f, ensure_ascii=False, indent=2)
+        _save_json(CUSTOM_WORDS_PATH, _custom_words)
     except Exception as exc:
         logger.error("Не удалось сохранить %s: %s", CUSTOM_WORDS_PATH, exc)
 
@@ -412,7 +426,11 @@ async def moderate_message(message: Message) -> None:
 
 
 def main() -> None:
-    logger.info("Бот-фильтр мата запущен и слушает сообщения...")
+    logger.info(
+        "Бот-фильтр мата запущен и слушает сообщения... "
+        "(ников: %s, своих слов: %s)",
+        len(_nicknames), len(_custom_words),
+    )
     bot.run()
 
 
