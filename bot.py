@@ -234,14 +234,33 @@ async def get_user_name(user_id: int) -> str:
     return name
 
 
-async def send_text(peer_id: int, text: str) -> None:
-    await bot.api.messages.send(
+async def send_text(peer_id: int, text: str, reply_to_cmid: int | None = None) -> None:
+    params = dict(
         peer_id=peer_id,
         message=text,
         random_id=random.randint(1, 2_147_483_647),
         # Упоминание остается кликабельной ссылкой, но не пингует человека.
         disable_mentions=True,
     )
+    if reply_to_cmid is not None:
+        # Реплей по conversation_message_id — штатный способ для ботов сообществ.
+        params["forward"] = json.dumps({
+            "peer_id": peer_id,
+            "conversation_message_ids": [reply_to_cmid],
+            "is_reply": True,
+        })
+    try:
+        await bot.api.messages.send(**params)
+    except VKAPIError as exc:
+        # Если сообщение, на которое отвечаем, уже удалено — шлем без реплея.
+        if reply_to_cmid is not None:
+            logger.warning(
+                "Не удалось ответить реплеем на cmid=%s (%s), отправляю без реплея",
+                reply_to_cmid, exc,
+            )
+            await send_text(peer_id, text)
+        else:
+            raise
 
 
 async def delete_message(message: Message) -> bool:
@@ -415,10 +434,17 @@ async def moderate_message(message: Message) -> None:
 
     # Пересылаем оригинальный текст без цензуры. Имя автора — кликабельная
     # ссылка на его профиль: [id123|Имя Фамилия] (или установленный !ник).
+    # Если оригинал был реплеем — отвечаем реплеем на то же сообщение.
     author_name = get_nickname(message.peer_id, message.from_id) or await get_user_name(message.from_id)
     author_link = f"[id{message.from_id}|{author_name}]"
+    reply_to_cmid = None
+    replied = getattr(message, "reply_message", None)
+    if replied is not None:
+        cmid = getattr(replied, "conversation_message_id", None)
+        if isinstance(cmid, int):
+            reply_to_cmid = cmid
     try:
-        await send_text(message.peer_id, f"{author_link}: {text}")
+        await send_text(message.peer_id, f"{author_link}: {text}", reply_to_cmid=reply_to_cmid)
     except VKAPIError as exc:
         logger.error(
             "Не удалось отправить копию сообщения в peer %s: %s", message.peer_id, exc
