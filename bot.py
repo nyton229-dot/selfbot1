@@ -545,17 +545,46 @@ async def handle_mat_command(message: Message, raw_arg: str) -> None:
         await send_text(peer_id, f"ℹ️ Это слово уже в списке: {word}")
 
 
-async def handle_profile_command(message: Message) -> None:
-    """«Профиль» — анкета участника беседы.
+async def resolve_user_id(raw: str) -> int | None:
+    """Достает id пользователя из упоминания или ссылки.
 
-    Если команда отправлена реплеем на чужое сообщение — показывает анкету
-    того пользователя, иначе — свою.
+    Понимает: [id123|Имя], vk.com/id123, vk.ru/id123, @id123, id123,
+    а также короткие имена (vk.com/durov, @durov) через resolveScreenName.
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    m = re.search(r"\[id(\d+)\|", raw)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?:vk\.(?:com|ru)/|@|^)id(\d+)$", raw)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?:vk\.(?:com|ru)/|@)([A-Za-z0-9_.]+)", raw)
+    screen_name = m.group(1) if m else (raw if re.fullmatch(r"[A-Za-z0-9_.]+", raw) else None)
+    if screen_name:
+        try:
+            resp = await bot.api.utils.resolve_screen_name(screen_name=screen_name)
+            obj_type = getattr(getattr(resp, "type", None), "value", None) or str(getattr(resp, "type", ""))
+            if obj_type == "user":
+                return getattr(resp, "object_id", None)
+        except Exception as exc:
+            logger.warning("Не удалось определить пользователя %r: %s", raw, exc)
+    return None
+
+
+async def handle_profile_command(message: Message, target_id: int | None = None) -> None:
+    """«Кто я» / «Профиль» — анкета участника беседы.
+
+    Если target_id не задан: команда, отправленная реплеем на чужое
+    сообщение, показывает анкету того пользователя, иначе — свою.
     """
     peer_id = message.peer_id
-    target_id = message.from_id
-    replied = getattr(message, "reply_message", None)
-    if replied is not None and getattr(replied, "from_id", 0) > 0:
-        target_id = replied.from_id
+    if target_id is None:
+        target_id = message.from_id
+        replied = getattr(message, "reply_message", None)
+        if replied is not None and getattr(replied, "from_id", 0) > 0:
+            target_id = replied.from_id
 
     name = await get_user_name(target_id)
     nick = get_nickname(peer_id, target_id)
@@ -638,11 +667,36 @@ async def moderate_message(message: Message) -> None:
     if command in {"!н", "!n"}:
         await handle_admin_info_command(message)
         return
-    # Анкету показываем, только если сообщение состоит из одной команды,
-    # чтобы не срабатывать на обычные фразы со словом «профиль».
-    if command in {"профиль", "!профиль", "анкета", "!анкета", "profile"} and not command_arg:
+    # «Кто я» и синонимы — анкета вызвавшего (или того, на кого ответили).
+    # Срабатывает только если сообщение состоит из одной команды, чтобы
+    # не реагировать на обычные фразы.
+    lowered_text = " ".join(text.lower().split()).rstrip("?!.")
+    if lowered_text in {
+        "кто я", "хто я", "!роль", "!кто я",
+        "профиль", "!профиль", "анкета", "!анкета", "profile",
+    }:
         await handle_profile_command(message)
         return
+
+    # «Кто ты» — анкета указанного пользователя (реплей или ссылка).
+    for prefix in ("кто ты", "хто ты", "!кто ты"):
+        if lowered_text == prefix or lowered_text.startswith(prefix + " "):
+            arg = text.strip()[len(prefix):].strip()
+            target_id = None
+            replied = getattr(message, "reply_message", None)
+            if replied is not None and getattr(replied, "from_id", 0) > 0:
+                target_id = replied.from_id
+            if target_id is None and arg:
+                target_id = await resolve_user_id(arg)
+            if target_id is None:
+                await send_text(
+                    message.peer_id,
+                    "🤔 Кого показать? Ответь командой «Кто ты» реплеем на сообщение "
+                    "или добавь ссылку: Кто ты vk.com/id123",
+                )
+                return
+            await handle_profile_command(message, target_id)
+            return
 
     if not contains_profanity(text) and not matches_custom_word(text):
         # Обычное сообщение — не трогаем.
