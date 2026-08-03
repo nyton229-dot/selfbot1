@@ -494,6 +494,20 @@ async def handle_mat_command(message: Message, raw_arg: str) -> None:
         await send_text(peer_id, f"ℹ️ Это слово уже в списке: {word}")
 
 
+async def handle_admin_info_command(message: Message) -> None:
+    """!н — показать, кто администратор бота, со ссылкой для связи."""
+    lines = []
+    for owner_id in sorted(BOT_OWNER_IDS):
+        name = await get_user_name(owner_id)
+        lines.append(f"👑 [id{owner_id}|{name}]")
+    await send_text(
+        message.peer_id,
+        "Администратор бота:\n"
+        + "\n".join(lines)
+        + "\n\n❓ По всем вопросам о боте пишите ему в личные сообщения.",
+    )
+
+
 @bot.on.message()
 async def moderate_message(message: Message) -> None:
     logger.debug(
@@ -522,6 +536,9 @@ async def moderate_message(message: Message) -> None:
         return
     if command in {"!мат", "!mat"}:
         await handle_mat_command(message, command_arg)
+        return
+    if command in {"!н", "!n"}:
+        await handle_admin_info_command(message)
         return
 
     if not contains_profanity(text) and not matches_custom_word(text):
