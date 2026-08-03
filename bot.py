@@ -79,6 +79,8 @@ async def send_text(peer_id: int, text: str) -> None:
         peer_id=peer_id,
         message=text,
         random_id=random.randint(1, 2_147_483_647),
+        # Упоминание остается кликабельной ссылкой, но не пингует человека.
+        disable_mentions=True,
     )
 
 
@@ -159,10 +161,12 @@ async def moderate_message(message: Message) -> None:
     if not deleted:
         return
 
-    # Пересылаем оригинальный текст без цензуры — просто от имени бота.
+    # Пересылаем оригинальный текст без цензуры. Имя автора — кликабельная
+    # ссылка на его профиль: [id123|Имя Фамилия].
     author_name = await get_user_name(message.from_id)
+    author_link = f"[id{message.from_id}|{author_name}]"
     try:
-        await send_text(message.peer_id, f"{author_name}: {text}")
+        await send_text(message.peer_id, f"{author_link}: {text}")
     except VKAPIError as exc:
         logger.error(
             "Не удалось отправить копию сообщения в peer %s: %s", message.peer_id, exc
