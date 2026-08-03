@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 from vkbottle import VKAPIError
 from vkbottle.bot import Bot, Message
 
-from profanity_filter import contains_profanity
+from profanity_filter import contains_profanity, text_core
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -115,6 +115,95 @@ def sanitize_nickname(raw: str) -> str:
     nick = raw.replace("[", "").replace("]", "").replace("|", "")
     nick = re.sub(r"\s+", " ", nick).strip()
     return nick[:NICKNAME_MAX_LEN].strip()
+
+
+# --- Свой список запрещенных слов (!мат) ----------------------------------
+
+CUSTOM_WORDS_PATH = os.path.join(os.path.dirname(__file__), "custom_words.json")
+CUSTOM_WORD_MIN_CORE_LEN = 3
+
+
+def _load_custom_words() -> list[str]:
+    try:
+        with open(CUSTOM_WORDS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return [w for w in data if isinstance(w, str)] if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception as exc:
+        logger.warning("Не удалось прочитать %s: %s", CUSTOM_WORDS_PATH, exc)
+        return []
+
+
+_custom_words: list[str] = _load_custom_words()
+# Нормализованные "ядра" слов — по ним идет поиск в сообщениях.
+_custom_cores: dict[str, str] = {w: text_core(w) for w in _custom_words}
+
+
+def _save_custom_words() -> None:
+    try:
+        with open(CUSTOM_WORDS_PATH, "w", encoding="utf-8") as f:
+            json.dump(_custom_words, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logger.error("Не удалось сохранить %s: %s", CUSTOM_WORDS_PATH, exc)
+
+
+def add_custom_word(word: str) -> bool:
+    core = text_core(word)
+    if core in _custom_cores.values():
+        return False
+    _custom_words.append(word)
+    _custom_cores[word] = core
+    _save_custom_words()
+    return True
+
+
+def remove_custom_word(word: str) -> bool:
+    core = text_core(word)
+    for existing, existing_core in list(_custom_cores.items()):
+        if existing_core == core:
+            _custom_words.remove(existing)
+            del _custom_cores[existing]
+            _save_custom_words()
+            return True
+    return False
+
+
+def matches_custom_word(text: str) -> bool:
+    if not _custom_cores:
+        return False
+    core = text_core(text)
+    return any(word_core and word_core in core for word_core in _custom_cores.values())
+
+
+# --- Проверка прав администратора беседы -----------------------------------
+
+_chat_admins_cache: dict[int, tuple[float, set[int]]] = {}
+CHAT_ADMINS_CACHE_TTL_SEC = 60.0
+
+
+async def is_chat_admin(peer_id: int, user_id: int) -> bool:
+    now = time.monotonic()
+    cached = _chat_admins_cache.get(peer_id)
+    if cached and now - cached[0] < CHAT_ADMINS_CACHE_TTL_SEC:
+        return user_id in cached[1]
+
+    admins: set[int] = set()
+    try:
+        response = await bot.api.messages.get_conversations_by_id(peer_ids=[peer_id])
+        items = getattr(response, "items", None) or []
+        if items:
+            settings = getattr(items[0], "chat_settings", None)
+            if settings is not None:
+                owner_id = getattr(settings, "owner_id", None)
+                if isinstance(owner_id, int):
+                    admins.add(owner_id)
+                admins.update(getattr(settings, "admin_ids", None) or [])
+    except Exception as exc:
+        logger.warning("Не удалось получить админов peer %s: %s", peer_id, exc)
+
+    _chat_admins_cache[peer_id] = (now, admins)
+    return user_id in admins
 
 
 async def get_user_name(user_id: int) -> str:
@@ -222,6 +311,52 @@ async def handle_nick_command(message: Message, raw_arg: str) -> None:
     await send_text(peer_id, f"✅ Готово! Теперь ты [id{user_id}|{nick}].")
 
 
+async def handle_mat_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    arg = raw_arg.strip()
+
+    if not arg:
+        await send_text(
+            peer_id,
+            "📝 Свой список запрещенных слов:\n"
+            "!мат <слово> — добавить (только админ беседы)\n"
+            "!мат удалить <слово> — убрать\n"
+            "!мат список — показать все",
+        )
+        return
+
+    lowered = arg.lower()
+    if lowered in {"список", "лист", "list"}:
+        if not _custom_words:
+            await send_text(peer_id, "📭 Свой список пуст. Добавь: !мат <слово>")
+            return
+        lines = "\n".join(f"{i + 1}. {w}" for i, w in enumerate(_custom_words))
+        await send_text(peer_id, f"📝 Свои запрещенные слова ({len(_custom_words)}):\n{lines}")
+        return
+
+    if not await is_chat_admin(peer_id, message.from_id):
+        await send_text(peer_id, "⛔ Добавлять и удалять слова может только админ беседы.")
+        return
+
+    if lowered.startswith(("удалить ", "убрать ", "-")):
+        word = arg.split(maxsplit=1)[1] if " " in arg else arg.lstrip("-").strip()
+        if remove_custom_word(word):
+            await send_text(peer_id, f"✅ Слово убрано из списка: {word}")
+        else:
+            await send_text(peer_id, f"❌ Слова нет в списке: {word}")
+        return
+
+    word = arg
+    core = text_core(word)
+    if len(core) < CUSTOM_WORD_MIN_CORE_LEN:
+        await send_text(peer_id, "❌ Слишком короткое слово, нужно минимум 3 буквы.")
+        return
+    if add_custom_word(word):
+        await send_text(peer_id, f"✅ Добавил в запрещенные: {word}\nТеперь буду удалять сообщения с ним.")
+    else:
+        await send_text(peer_id, f"ℹ️ Это слово уже в списке: {word}")
+
+
 @bot.on.message()
 async def moderate_message(message: Message) -> None:
     logger.debug(
@@ -241,13 +376,18 @@ async def moderate_message(message: Message) -> None:
     if not text.strip():
         return
 
-    # Команда "!ник <новый ник>" — сменить отображаемое имя в пересылках.
+    # Команды бота.
     parts = text.split(maxsplit=1)
-    if parts and parts[0].lower() in {"!ник", "!nick"}:
-        await handle_nick_command(message, parts[1] if len(parts) > 1 else "")
+    command = parts[0].lower() if parts else ""
+    command_arg = parts[1] if len(parts) > 1 else ""
+    if command in {"!ник", "!nick"}:
+        await handle_nick_command(message, command_arg)
+        return
+    if command in {"!мат", "!mat"}:
+        await handle_mat_command(message, command_arg)
         return
 
-    if not contains_profanity(text):
+    if not contains_profanity(text) and not matches_custom_word(text):
         # Обычное сообщение — не трогаем.
         return
 

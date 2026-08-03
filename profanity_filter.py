@@ -245,3 +245,12 @@ def censor_text(text: str) -> tuple[bool, str]:
 
 def contains_profanity(text: str) -> bool:
     return censor_text(text)[0]
+
+
+def text_core(text: str) -> str:
+    """Нормализованное "ядро" текста: только буквы, без масок и повторов.
+
+    Используется для сравнения с пользовательским списком запрещенных слов:
+    "П р И в 3 т" и "привет" дают одинаковое ядро.
+    """
+    return collapse_repeats(letters_only(normalize_text(text)))
