@@ -5,7 +5,7 @@
 2. Обычные сообщения не трогает.
 3. Если в сообщении найден мат:
    - мгновенно удаляет оригинал для всех (delete_for_all=1);
-   - отправляет в чат копию в формате "Имя Фамилия: <текст с цензурой>".
+   - отправляет в чат копию в формате "Имя Фамилия: <оригинальный текст>".
 
 Требования:
 - токен сообщества VK (VK_GROUP_TOKEN в .env) с правом на сообщения;
@@ -25,10 +25,10 @@ from dotenv import load_dotenv
 from vkbottle import VKAPIError
 from vkbottle.bot import Bot, Message
 
-from profanity_filter import censor_text
+from profanity_filter import contains_profanity
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("vk-mat-filter")
@@ -130,6 +130,11 @@ async def warn_about_rights(peer_id: int) -> None:
 
 @bot.on.message()
 async def moderate_message(message: Message) -> None:
+    logger.debug(
+        "Сообщение peer=%s from=%s cmid=%s: %r",
+        message.peer_id, message.from_id, message.conversation_message_id,
+        (message.text or "")[:80],
+    )
     # Работаем только в беседах.
     if message.peer_id < CHAT_PEER_ID_START:
         return
@@ -142,8 +147,7 @@ async def moderate_message(message: Message) -> None:
     if not text.strip():
         return
 
-    has_profanity, censored = censor_text(text)
-    if not has_profanity:
+    if not contains_profanity(text):
         # Обычное сообщение — не трогаем.
         return
 
@@ -155,12 +159,13 @@ async def moderate_message(message: Message) -> None:
     if not deleted:
         return
 
+    # Пересылаем оригинальный текст без цензуры — просто от имени бота.
     author_name = await get_user_name(message.from_id)
     try:
-        await send_text(message.peer_id, f"{author_name}: {censored}")
+        await send_text(message.peer_id, f"{author_name}: {text}")
     except VKAPIError as exc:
         logger.error(
-            "Не удалось отправить цензурную копию в peer %s: %s", message.peer_id, exc
+            "Не удалось отправить копию сообщения в peer %s: %s", message.peer_id, exc
         )
 
 
