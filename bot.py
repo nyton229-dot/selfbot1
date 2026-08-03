@@ -260,6 +260,116 @@ def record_violation_stat(peer_id: int, user_id: int) -> None:
     _save_stats(force=True)
 
 
+# --- Предупреждения (!варн) -------------------------------------------------
+
+WARN_LIMIT = 3
+
+
+def get_warns(peer_id: int, user_id: int) -> int:
+    entry = _stats.get(_nick_key(peer_id, user_id)) or {}
+    return entry.get("warns", 0)
+
+
+def change_warns(peer_id: int, user_id: int, delta: int) -> int:
+    entry = _stats.setdefault(
+        _nick_key(peer_id, user_id), {"msgs": 0, "viol": 0, "first": time.time()}
+    )
+    entry["warns"] = max(0, entry.get("warns", 0) + delta)
+    _save_stats(force=True)
+    return entry["warns"]
+
+
+def reset_warns(peer_id: int, user_id: int) -> None:
+    entry = _stats.get(_nick_key(peer_id, user_id))
+    if entry is not None:
+        entry["warns"] = 0
+        _save_stats(force=True)
+
+
+# --- Мут (!мут / !размут) ----------------------------------------------------
+
+MUTES_PATH = os.path.join(DATA_DIR, "mutes.json")
+MUTE_DEFAULT_SEC = 10 * 60
+MUTE_MAX_SEC = 7 * 24 * 3600
+
+
+def _load_mutes() -> dict[str, float]:
+    try:
+        with open(MUTES_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Не удалось прочитать %s: %s", MUTES_PATH, exc)
+        return {}
+
+
+_mutes: dict[str, float] = _load_mutes()
+
+
+def _save_mutes() -> None:
+    try:
+        _save_json(MUTES_PATH, _mutes)
+    except Exception as exc:
+        logger.error("Не удалось сохранить %s: %s", MUTES_PATH, exc)
+
+
+def is_muted(peer_id: int, user_id: int) -> bool:
+    key = _nick_key(peer_id, user_id)
+    until = _mutes.get(key)
+    if until is None:
+        return False
+    if until > time.time():
+        return True
+    del _mutes[key]
+    _save_mutes()
+    return False
+
+
+def set_mute(peer_id: int, user_id: int, duration_sec: int) -> float:
+    until = time.time() + duration_sec
+    _mutes[_nick_key(peer_id, user_id)] = until
+    _save_mutes()
+    return until
+
+
+def clear_mute(peer_id: int, user_id: int) -> bool:
+    if _mutes.pop(_nick_key(peer_id, user_id), None) is not None:
+        _save_mutes()
+        return True
+    return False
+
+
+def parse_duration_sec(raw: str) -> int | None:
+    """«10м», «2ч», «30с», «1д», просто «10» (минуты)."""
+    m = re.fullmatch(r"(\d+)\s*(с|сек|c|s|м|мин|m|min|ч|час|h|д|дн|d)?\.?", raw.strip().lower())
+    if not m:
+        return None
+    value = int(m.group(1))
+    unit = m.group(2) or "м"
+    if unit in {"с", "сек", "c", "s"}:
+        mult = 1
+    elif unit in {"м", "мин", "m", "min"}:
+        mult = 60
+    elif unit in {"ч", "час", "h"}:
+        mult = 3600
+    else:
+        mult = 86400
+    return max(1, min(value * mult, MUTE_MAX_SEC))
+
+
+def format_duration(sec: float) -> str:
+    sec = int(sec)
+    if sec >= 86400:
+        return f"{sec // 86400} дн"
+    if sec >= 3600:
+        return f"{sec // 3600} ч"
+    if sec >= 60:
+        return f"{sec // 60} мин"
+    return f"{sec} сек"
+
+
 # --- Проверка прав администратора беседы -----------------------------------
 
 _chat_admins_cache: dict[int, tuple[float, set[int]]] = {}
@@ -599,6 +709,7 @@ async def handle_profile_command(message: Message, target_id: int | None = None)
     entry = _stats.get(_nick_key(peer_id, target_id)) or {}
     msgs = entry.get("msgs", 0)
     viol = entry.get("viol", 0)
+    warns = entry.get("warns", 0)
     first = entry.get("first")
     since = time.strftime("%d.%m.%Y", time.localtime(first)) if first else "—"
 
@@ -614,8 +725,202 @@ async def handle_profile_command(message: Message, target_id: int | None = None)
         f"🎖 Роль: {role}",
         f"💬 Сообщений: {msgs}",
         f"🤬 Удалено за мат: {viol}",
+        f"⚠️ Предупреждения: {warns}/{WARN_LIMIT}",
         f"📅 Первое сообщение: {since}",
     ]
+    mute_until = _mutes.get(_nick_key(peer_id, target_id))
+    if mute_until and mute_until > time.time():
+        lines.append(f"🔇 В муте еще {format_duration(mute_until - time.time())}")
+    await send_text(peer_id, "\n".join(lines))
+
+
+async def extract_target(message: Message, arg: str) -> tuple[int | None, str]:
+    """Определяет пользователя-цель команды: реплей или ссылка в аргументе.
+
+    Возвращает (user_id | None, аргумент без ссылки).
+    """
+    replied = getattr(message, "reply_message", None)
+    if replied is not None and getattr(replied, "from_id", 0) > 0:
+        return replied.from_id, arg
+
+    tokens = arg.split()
+    for i, token in enumerate(tokens):
+        if not re.search(r"\[id\d+|vk\.(com|ru)/|@|^id\d+$", token):
+            continue
+        user_id = await resolve_user_id(token)
+        if user_id:
+            rest = " ".join(tokens[:i] + tokens[i + 1:])
+            return user_id, rest
+    return None, arg
+
+
+async def kick_user(peer_id: int, user_id: int) -> bool:
+    try:
+        await bot.api.messages.remove_chat_user(
+            chat_id=peer_id - CHAT_PEER_ID_START, member_id=user_id
+        )
+        return True
+    except VKAPIError as exc:
+        logger.warning("Не удалось кикнуть id%s из peer %s: %s", user_id, peer_id, exc)
+        return False
+
+
+async def _target_link(peer_id: int, user_id: int) -> str:
+    name = get_nickname(peer_id, user_id) or await get_user_name(user_id)
+    return f"[id{user_id}|{name}]"
+
+
+async def handle_warn_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    if not await can_manage_bot(peer_id, message.from_id):
+        await send_text(peer_id, "⛔ Выдавать предупреждения может только админ.")
+        return
+
+    arg = raw_arg.strip()
+    removing = False
+    lowered = arg.lower()
+    for prefix in ("снять", "убрать", "-"):
+        if lowered.startswith(prefix):
+            removing = True
+            arg = arg[len(prefix):].strip()
+            break
+
+    target_id, _ = await extract_target(message, arg)
+    if target_id is None:
+        await send_text(
+            peer_id,
+            "⚠️ Кому предупреждение? Ответь «!варн» реплеем на сообщение "
+            "или добавь ссылку: !варн vk.com/id123\n"
+            "Снять: !варн снять (реплеем/ссылкой)",
+        )
+        return
+
+    link = await _target_link(peer_id, target_id)
+
+    if removing:
+        if get_warns(peer_id, target_id) == 0:
+            await send_text(peer_id, f"ℹ️ У {link} нет предупреждений.")
+            return
+        warns = change_warns(peer_id, target_id, -1)
+        await send_text(peer_id, f"✅ Снял предупреждение. Теперь у {link}: {warns}/{WARN_LIMIT}")
+        return
+
+    if target_id in BOT_OWNER_IDS:
+        await send_text(peer_id, "😎 Главному админу бота предупреждения не выдаются.")
+        return
+
+    warns = change_warns(peer_id, target_id, +1)
+    if warns < WARN_LIMIT:
+        await send_text(peer_id, f"⚠️ {link} получает предупреждение: {warns}/{WARN_LIMIT}")
+        return
+
+    if await kick_user(peer_id, target_id):
+        reset_warns(peer_id, target_id)
+        await send_text(peer_id, f"🚫 {link} набрал {WARN_LIMIT}/{WARN_LIMIT} предупреждений и исключен из беседы.")
+    else:
+        await send_text(
+            peer_id,
+            f"⚠️ {link} набрал {WARN_LIMIT}/{WARN_LIMIT}, но у меня нет прав исключить его. "
+            "Дайте боту права администратора беседы.",
+        )
+
+
+async def handle_mute_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    if not await can_manage_bot(peer_id, message.from_id):
+        await send_text(peer_id, "⛔ Выдавать мут может только админ.")
+        return
+
+    target_id, rest = await extract_target(message, raw_arg.strip())
+    if target_id is None:
+        await send_text(
+            peer_id,
+            "🔇 Кого замутить? Ответь «!мут 10м» реплеем на сообщение "
+            "или добавь ссылку: !мут vk.com/id123 30м\n"
+            "Время: 30с, 10м, 2ч, 1д (по умолчанию 10 минут).",
+        )
+        return
+
+    if target_id in BOT_OWNER_IDS:
+        await send_text(peer_id, "😎 Главного админа бота замутить нельзя.")
+        return
+
+    duration = MUTE_DEFAULT_SEC
+    for token in rest.split():
+        parsed = parse_duration_sec(token)
+        if parsed is not None:
+            duration = parsed
+            break
+
+    set_mute(peer_id, target_id, duration)
+    link = await _target_link(peer_id, target_id)
+    await send_text(
+        peer_id,
+        f"🔇 {link} замучен на {format_duration(duration)}. "
+        "Все его сообщения будут удаляться.\nСнять: !размут",
+    )
+
+
+async def handle_unmute_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    if not await can_manage_bot(peer_id, message.from_id):
+        await send_text(peer_id, "⛔ Снимать мут может только админ.")
+        return
+
+    target_id, _ = await extract_target(message, raw_arg.strip())
+    if target_id is None:
+        await send_text(peer_id, "🔊 Кого размутить? Ответь «!размут» реплеем или добавь ссылку.")
+        return
+
+    link = await _target_link(peer_id, target_id)
+    if clear_mute(peer_id, target_id):
+        await send_text(peer_id, f"🔊 {link} размучен, может писать снова.")
+    else:
+        await send_text(peer_id, f"ℹ️ {link} и так не в муте.")
+
+
+async def handle_stats_command(message: Message) -> None:
+    peer_id = message.peer_id
+    prefix = f"{peer_id}:"
+    entries: dict[int, dict] = {}
+    for key, entry in _stats.items():
+        if key.startswith(prefix):
+            try:
+                entries[int(key[len(prefix):])] = entry
+            except ValueError:
+                continue
+
+    total_msgs = sum(e.get("msgs", 0) for e in entries.values())
+    total_viol = sum(e.get("viol", 0) for e in entries.values())
+    total_warns = sum(e.get("warns", 0) for e in entries.values())
+    now = time.time()
+    muted = sum(
+        1 for key, until in _mutes.items() if key.startswith(prefix) and until > now
+    )
+
+    lines = [
+        "📊 Статистика беседы",
+        "➖➖➖➖➖➖➖➖➖➖",
+        f"💬 Сообщений: {total_msgs}",
+        f"🤬 Удалено за мат: {total_viol}",
+        f"⚠️ Активных предупреждений: {total_warns}",
+        f"🔇 В муте: {muted}",
+    ]
+
+    top_active = sorted(entries.items(), key=lambda kv: kv[1].get("msgs", 0), reverse=True)[:5]
+    top_active = [(uid, e) for uid, e in top_active if e.get("msgs", 0) > 0]
+    if top_active:
+        lines.append("\n🏆 Самые активные:")
+        for i, (uid, e) in enumerate(top_active, 1):
+            lines.append(f"{i}. {await _target_link(peer_id, uid)} — {e.get('msgs', 0)}")
+
+    top_viol = sorted(entries.items(), key=lambda kv: kv[1].get("viol", 0), reverse=True)[:5]
+    top_viol = [(uid, e) for uid, e in top_viol if e.get("viol", 0) > 0]
+    if top_viol:
+        lines.append("\n🤬 Топ нарушителей:")
+        for i, (uid, e) in enumerate(top_viol, 1):
+            lines.append(f"{i}. {await _target_link(peer_id, uid)} — {e.get('viol', 0)}")
+
     await send_text(peer_id, "\n".join(lines))
 
 
@@ -648,6 +953,11 @@ async def moderate_message(message: Message) -> None:
     if message.from_id <= 0:
         return
 
+    # Замученные пишут «в пустоту»: удаляем всё, включая вложения без текста.
+    if is_muted(message.peer_id, message.from_id):
+        await delete_message(message)
+        return
+
     text = message.text or ""
     if not text.strip():
         return
@@ -667,6 +977,18 @@ async def moderate_message(message: Message) -> None:
     if command in {"!н", "!n"}:
         await handle_admin_info_command(message)
         return
+    if command in {"!варн", "!warn"}:
+        await handle_warn_command(message, command_arg)
+        return
+    if command in {"!мут", "!mute"}:
+        await handle_mute_command(message, command_arg)
+        return
+    if command in {"!размут", "!анмут", "!unmute"}:
+        await handle_unmute_command(message, command_arg)
+        return
+    if command in {"!стата", "!статистика", "!stats"} and not command_arg:
+        await handle_stats_command(message)
+        return
     # «Кто я» и синонимы — анкета вызвавшего (или того, на кого ответили).
     # Срабатывает только если сообщение состоит из одной команды, чтобы
     # не реагировать на обычные фразы.
@@ -676,6 +998,10 @@ async def moderate_message(message: Message) -> None:
         "профиль", "!профиль", "анкета", "!анкета", "profile",
     }:
         await handle_profile_command(message)
+        return
+
+    if lowered_text == "стата":
+        await handle_stats_command(message)
         return
 
     # «Кто ты» — анкета указанного пользователя (реплей или ссылка).
