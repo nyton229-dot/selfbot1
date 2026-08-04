@@ -82,10 +82,23 @@ _last_rights_warning: dict[int, float] = {}
 
 # --- Хранилище данных бота ------------------------------------------------
 
-# Папку с данными можно вынести (например, тесты используют временную,
-# чтобы не трогать файлы живого бота).
-DATA_DIR = os.getenv("BOT_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+# Данные храним в папке data/: на хостингах (например, Bothost) именно она
+# переживает перезапуски и переустановки контейнера. Папку можно переопределить
+# через BOT_DATA_DIR (тесты используют временную).
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.getenv("BOT_DATA_DIR") or os.path.join(_BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# Миграция со старой схемы: раньше файлы лежали рядом с bot.py.
+for _fname in ("nicknames.json", "custom_words.json", "stats.json", "mutes.json"):
+    _old_path = os.path.join(_BASE_DIR, _fname)
+    _new_path = os.path.join(DATA_DIR, _fname)
+    if _old_path != _new_path and os.path.exists(_old_path) and not os.path.exists(_new_path):
+        try:
+            os.replace(_old_path, _new_path)
+            logger.info("Перенес %s в %s", _fname, DATA_DIR)
+        except OSError as exc:
+            logger.warning("Не удалось перенести %s в %s: %s", _fname, DATA_DIR, exc)
 
 
 def _save_json(path: str, data) -> None:
