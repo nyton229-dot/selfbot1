@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -693,6 +694,93 @@ async def send_text(
 _photo_uploader = PhotoMessageUploader(bot.api)
 _doc_uploader = DocMessagesUploader(bot.api)
 _voice_uploader = VoiceMessageUploader(bot.api)
+
+
+# --- Демотиватор (!дем) --------------------------------------------------------
+
+_FONT_CANDIDATES = [
+    os.path.join(_BASE_DIR, "fonts", "DejaVuSerif.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+]
+
+
+def _load_font(size: int):
+    from PIL import ImageFont
+
+    for path in _FONT_CANDIDATES:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    return ImageFont.load_default(size)
+
+
+def make_demotivator(photo: bytes, title: str, subtitle: str = "") -> bytes:
+    """Классический демотиватор: черный фон, белая рамка, подпись серифом."""
+    from PIL import Image, ImageDraw, ImageOps
+
+    img = Image.open(io.BytesIO(photo))
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    target_w = 600
+    img = img.resize((target_w, max(1, round(img.height * target_w / img.width))))
+
+    margin_x, margin_top, gap = 60, 45, 6
+    canvas_w = target_w + margin_x * 2
+    max_text_w = canvas_w - 50
+
+    title_font = _load_font(52)
+    sub_font = _load_font(28)
+    dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+    def wrap(text: str, font) -> list[str]:
+        lines: list[str] = []
+        for para in text.split("\n"):
+            cur = ""
+            for word in para.split():
+                trial = f"{cur} {word}".strip()
+                if not cur or dummy.textlength(trial, font=font) <= max_text_w:
+                    cur = trial
+                else:
+                    lines.append(cur)
+                    cur = word
+            if cur:
+                lines.append(cur)
+        return lines
+
+    title_lines = wrap(title, title_font) if title else []
+    sub_lines = wrap(subtitle, sub_font) if subtitle else []
+    title_lh = int(title_font.size * 1.3)
+    sub_lh = int(sub_font.size * 1.35)
+
+    text_h = 0
+    if title_lines:
+        text_h += 34 + len(title_lines) * title_lh
+    if sub_lines:
+        text_h += 12 + len(sub_lines) * sub_lh
+    canvas_h = margin_top + img.height + gap + text_h + 42
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), "black")
+    canvas.paste(img, (margin_x, margin_top))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle(
+        (margin_x - gap - 2, margin_top - gap - 2,
+         margin_x + target_w + gap + 1, margin_top + img.height + gap + 1),
+        outline="white", width=2,
+    )
+
+    y = margin_top + img.height + gap + (34 if title_lines else 0)
+    for line in title_lines:
+        w = dummy.textlength(line, font=title_font)
+        draw.text(((canvas_w - w) / 2, y), line, font=title_font, fill="white")
+        y += title_lh
+    if sub_lines:
+        y += 12
+    for line in sub_lines:
+        w = dummy.textlength(line, font=sub_font)
+        draw.text(((canvas_w - w) / 2, y), line, font=sub_font, fill="#cccccc")
+        y += sub_lh
+
+    out = io.BytesIO()
+    canvas.save(out, format="JPEG", quality=92)
+    return out.getvalue()
 
 
 def _largest_photo_url(photo) -> str | None:
@@ -1505,6 +1593,7 @@ async def handle_help_command(message: Message) -> None:
         "\nℹ️ Прочее:\n"
         "• Стата — статистика беседы\n"
         "• !онлайн — кто сейчас в сети\n"
+        "• !дем <текст> + фото — сделать демотиватор\n"
         "• !н — администратор бота",
     )
 
@@ -1545,6 +1634,52 @@ async def handle_online_command(message: Message) -> None:
         peer_id,
         f"🟢 Сейчас онлайн ({len(online)} из {len(user_ids)}):\n" + "\n".join(online),
     )
+
+
+async def handle_dem_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    text = raw_arg.strip()
+
+    photo = None
+    for source in (message, getattr(message, "reply_message", None)):
+        if source is None:
+            continue
+        for att in (getattr(source, "attachments", None) or []):
+            att_type = getattr(att.type, "value", None) or str(att.type)
+            if att_type == "photo" and att.photo is not None:
+                photo = att.photo
+                break
+        if photo is not None:
+            break
+
+    if photo is None or not text:
+        await send_text(
+            peer_id,
+            "🖼 Демотиватор:\n"
+            "!дем <текст> + фото в этом же сообщении\n"
+            "или ответь командой на сообщение с фото.\n"
+            "Вторая строка мелким шрифтом — через |:\n"
+            "!дем Понедельник | день тяжелый",
+        )
+        return
+
+    url = _largest_photo_url(photo)
+    if not url:
+        await send_text(peer_id, "😔 Не смог достать это фото, попробуй другое.")
+        return
+
+    title, _, subtitle = text.partition("|")
+    try:
+        data = await _download(url)
+        result = make_demotivator(data, title.strip(), subtitle.strip())
+        attachment = await _photo_uploader.upload(result, peer_id=peer_id)
+        await bot.api.messages.send(
+            peer_id=peer_id, random_id=random.randint(1, 2_147_483_647),
+            attachment=attachment,
+        )
+    except Exception as exc:
+        logger.error("Не удалось сделать демотиватор в peer %s: %s", peer_id, exc)
+        await send_text(peer_id, "😔 Не получилось сделать демотиватор, попробуй другое фото.")
 
 
 async def handle_admin_info_command(message: Message) -> None:
@@ -1639,6 +1774,9 @@ async def moderate_message(message: Message) -> None:
         return
     if command in {"!онлайн", "!online"} or (command == "онлайн" and not command_arg):
         await handle_online_command(message)
+        return
+    if command in {"!дем", "!dem"}:
+        await handle_dem_command(message, command_arg)
         return
     # «Кто я» и синонимы — анкета вызвавшего (или того, на кого ответили).
     # Срабатывает только если сообщение состоит из одной команды, чтобы
