@@ -169,6 +169,47 @@ def sanitize_nickname(raw: str) -> str:
     return nick[:NICKNAME_MAX_LEN].strip()
 
 
+# --- Настройки беседы (приветствие и т.п.) ---------------------------------
+
+CHAT_SETTINGS_PATH = os.path.join(DATA_DIR, "chat_settings.json")
+DEFAULT_GREETING = (
+    "👋 {name}, добро пожаловать в беседу!\n"
+    "Я слежу за порядком: сообщения с матом удаляю.\n"
+    "Список команд — напиши «помощь»."
+)
+
+
+def _load_chat_settings() -> dict[str, dict]:
+    try:
+        with open(CHAT_SETTINGS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Не удалось прочитать %s: %s", CHAT_SETTINGS_PATH, exc)
+        return {}
+
+
+_chat_settings: dict[str, dict] = _load_chat_settings()
+
+
+def _save_chat_settings() -> None:
+    try:
+        _save_json(CHAT_SETTINGS_PATH, _chat_settings)
+    except Exception as exc:
+        logger.error("Не удалось сохранить %s: %s", CHAT_SETTINGS_PATH, exc)
+
+
+def get_chat_setting(peer_id: int, key: str):
+    return (_chat_settings.get(str(peer_id)) or {}).get(key)
+
+
+def set_chat_setting(peer_id: int, key: str, value) -> None:
+    _chat_settings.setdefault(str(peer_id), {})[key] = value
+    _save_chat_settings()
+
+
 # --- Свой список запрещенных слов (!мат) ----------------------------------
 
 CUSTOM_WORDS_PATH = os.path.join(DATA_DIR, "custom_words.json")
@@ -1384,6 +1425,128 @@ async def on_message_event(event: GroupTypes.MessageEvent) -> None:
         logger.warning("Не удалось ответить на нажатие кнопки: %s", exc)
 
 
+async def handle_chat_action(message: Message) -> None:
+    """Служебные события беседы: вход нового участника — приветствие."""
+    action = message.action
+    atype = getattr(getattr(action, "type", None), "value", None) or str(getattr(action, "type", ""))
+    if atype not in {"chat_invite_user", "chat_invite_user_by_link"}:
+        return
+
+    new_id = getattr(action, "member_id", None) or message.from_id
+    if not isinstance(new_id, int) or new_id <= 0:
+        return
+
+    greeting = get_chat_setting(message.peer_id, "greeting")
+    if greeting == "":  # приветствие выключено
+        return
+    text = greeting or DEFAULT_GREETING
+    link = await _target_link(message.peer_id, new_id)
+    await send_text(message.peer_id, text.replace("{name}", link))
+
+
+async def handle_greeting_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    arg = raw_arg.strip()
+
+    if not arg:
+        current = get_chat_setting(peer_id, "greeting")
+        if current == "":
+            status = "🔕 Приветствие выключено."
+        elif current:
+            status = f"Текущее приветствие:\n{current}"
+        else:
+            status = f"Приветствие стандартное:\n{DEFAULT_GREETING}"
+        await send_text(
+            peer_id,
+            f"{status}\n\n"
+            "✏️ Настроить (только админ):\n"
+            "!приветствие <текст> — свой текст ({name} заменится на имя новичка)\n"
+            "!приветствие выкл — отключить\n"
+            "!приветствие сброс — вернуть стандартное",
+        )
+        return
+
+    if not await can_manage_bot(peer_id, message.from_id):
+        await send_text(peer_id, "⛔ Менять приветствие может только админ.")
+        return
+
+    lowered = arg.lower()
+    if lowered in {"выкл", "офф", "off"}:
+        set_chat_setting(peer_id, "greeting", "")
+        await send_text(peer_id, "🔕 Приветствие новичков выключено.")
+        return
+    if lowered in {"сброс", "стандарт", "reset"}:
+        set_chat_setting(peer_id, "greeting", None)
+        await send_text(peer_id, "✅ Вернул стандартное приветствие.")
+        return
+
+    set_chat_setting(peer_id, "greeting", arg)
+    preview = arg.replace("{name}", await _target_link(peer_id, message.from_id))
+    await send_text(peer_id, f"✅ Приветствие обновлено! Вот как оно будет выглядеть:\n\n{preview}")
+
+
+async def handle_help_command(message: Message) -> None:
+    await send_text(
+        message.peer_id,
+        "📖 Команды бота:\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        "👤 Профиль:\n"
+        "• Кто я (Профиль, !роль) — твоя анкета\n"
+        "• Кто ты (реплеем или ссылкой) — анкета другого\n"
+        "• !ник <ник> — сменить ник (!ник сброс)\n"
+        "\n🛡 Модерация (админ):\n"
+        "• !мат <слово> — свое запрещенное слово (!мат удалить, !мат список)\n"
+        "• !варн (реплеем/ссылкой) — предупреждение, 3/3 — кик (!варн снять)\n"
+        "• !мут 10м / !размут — мут на время\n"
+        "• !приветствие <текст> — приветствие новичков\n"
+        "\n🎮 Игры:\n"
+        "• !км вызов — крестики-нолики\n"
+        "• !рулетка <ставка> — казино (!баланс, !бонус)\n"
+        "\nℹ️ Прочее:\n"
+        "• Стата — статистика беседы\n"
+        "• !онлайн — кто сейчас в сети\n"
+        "• !н — администратор бота",
+    )
+
+
+async def handle_online_command(message: Message) -> None:
+    peer_id = message.peer_id
+    try:
+        members = await bot.api.messages.get_conversation_members(peer_id=peer_id)
+    except VKAPIError as exc:
+        logger.warning("Не удалось получить участников peer %s: %s", peer_id, exc)
+        await send_text(
+            peer_id,
+            "⛔ Не могу получить список участников — мне нужны права администратора беседы.",
+        )
+        return
+
+    user_ids = [
+        m.member_id for m in (getattr(members, "items", None) or [])
+        if getattr(m, "member_id", 0) > 0
+    ]
+    online: list[str] = []
+    for i in range(0, len(user_ids), 100):
+        chunk = user_ids[i:i + 100]
+        try:
+            users = await bot.api.users.get(user_ids=chunk, fields=["online"])
+        except VKAPIError as exc:
+            logger.warning("users.get не удался: %s", exc)
+            continue
+        for u in users:
+            if getattr(u, "online", 0):
+                name = f"{u.first_name} {u.last_name}".strip()
+                online.append(f"🟢 [id{u.id}|{name}]")
+
+    if not online:
+        await send_text(peer_id, "😴 Сейчас никого нет онлайн.")
+        return
+    await send_text(
+        peer_id,
+        f"🟢 Сейчас онлайн ({len(online)} из {len(user_ids)}):\n" + "\n".join(online),
+    )
+
+
 async def handle_admin_info_command(message: Message) -> None:
     """!н — показать, кто администратор бота, со ссылкой для связи."""
     lines = []
@@ -1407,6 +1570,11 @@ async def moderate_message(message: Message) -> None:
     )
     # Работаем только в беседах.
     if message.peer_id < CHAT_PEER_ID_START:
+        return
+
+    # Служебные события (вход нового участника) — приветствие.
+    if getattr(message, "action", None) is not None:
+        await handle_chat_action(message)
         return
 
     # Сообщения от сообществ (в том числе собственные репосты бота) не трогаем.
@@ -1460,6 +1628,17 @@ async def moderate_message(message: Message) -> None:
         return
     if command in {"!бонус", "!bonus"} or (command == "бонус" and not command_arg):
         await handle_bonus_command(message)
+        return
+    if command in {"!приветствие", "!greeting"}:
+        await handle_greeting_command(message, command_arg)
+        return
+    if command in {"!помощь", "!команды", "!help"} or (
+        command in {"помощь", "команды", "help"} and not command_arg
+    ):
+        await handle_help_command(message)
+        return
+    if command in {"!онлайн", "!online"} or (command == "онлайн" and not command_arg):
+        await handle_online_command(message)
         return
     # «Кто я» и синонимы — анкета вызвавшего (или того, на кого ответили).
     # Срабатывает только если сообщение состоит из одной команды, чтобы
