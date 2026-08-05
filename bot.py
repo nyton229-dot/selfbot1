@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -781,6 +782,91 @@ def make_demotivator(photo: bytes, title: str, subtitle: str = "") -> bytes:
     out = io.BytesIO()
     canvas.save(out, format="JPEG", quality=92)
     return out.getvalue()
+
+
+# --- Наложение лица (!пс) -------------------------------------------------------
+
+FACE_MODEL_PATH = os.path.join(_BASE_DIR, "models", "face_detection_yunet_2023mar.onnx")
+FACE_MAX_SIDE = 1000
+
+
+def _detect_faces(img) -> list[tuple[int, int, int, int]]:
+    """Находит лица, возвращает прямоугольники (x, y, w, h) по убыванию площади."""
+    import cv2
+
+    h, w = img.shape[:2]
+    detector = cv2.FaceDetectorYN.create(FACE_MODEL_PATH, "", (w, h), 0.6)
+    detector.setInputSize((w, h))
+    _, faces = detector.detect(img)
+    if faces is None:
+        return []
+    rects = []
+    for f in faces:
+        x, y, fw, fh = (int(v) for v in f[:4])
+        x, y = max(0, x), max(0, y)
+        fw, fh = min(fw, w - x), min(fh, h - y)
+        if fw > 10 and fh > 10:
+            rects.append((x, y, fw, fh))
+    return sorted(rects, key=lambda r: r[2] * r[3], reverse=True)
+
+
+def _shrink(img):
+    import cv2
+
+    h, w = img.shape[:2]
+    scale = FACE_MAX_SIDE / max(h, w)
+    if scale >= 1:
+        return img
+    return cv2.resize(img, (int(w * scale), int(h * scale)))
+
+
+def face_swap(face_photo: bytes, target_photo: bytes) -> bytes:
+    """Вырезает лицо с первого фото и вклеивает на все лица второго."""
+    import cv2
+    import numpy as np
+
+    src = cv2.imdecode(np.frombuffer(face_photo, np.uint8), cv2.IMREAD_COLOR)
+    dst = cv2.imdecode(np.frombuffer(target_photo, np.uint8), cv2.IMREAD_COLOR)
+    if src is None or dst is None:
+        raise ValueError("bad image")
+    src = _shrink(src)
+    dst = _shrink(dst)
+
+    src_faces = _detect_faces(src)
+    if not src_faces:
+        raise LookupError("no face in source")
+    dst_faces = _detect_faces(dst)
+    if not dst_faces:
+        raise LookupError("no face in target")
+
+    # Лицо-донор с запасом вокруг (лоб/подбородок).
+    x, y, w, h = src_faces[0]
+    mx, my = int(w * 0.15), int(h * 0.2)
+    x0, y0 = max(0, x - mx), max(0, y - my)
+    x1, y1 = min(src.shape[1], x + w + mx), min(src.shape[0], y + h + my)
+    face = src[y0:y1, x0:x1]
+
+    for fx, fy, fw, fh in dst_faces:
+        # Целевой прямоугольник чуть больше найденного лица.
+        pw, ph = int(fw * 1.35), int(fh * 1.45)
+        cx, cy = fx + fw // 2, fy + fh // 2
+        # Патч должен целиком помещаться в кадр (требование seamlessClone).
+        pw = min(pw, 2 * cx, 2 * (dst.shape[1] - cx) - 2)
+        ph = min(ph, 2 * cy, 2 * (dst.shape[0] - cy) - 2)
+        if pw < 12 or ph < 12:
+            continue
+        patch = cv2.resize(face, (pw, ph))
+        mask = np.zeros((ph, pw), np.uint8)
+        cv2.ellipse(mask, (pw // 2, ph // 2), (int(pw * 0.42), int(ph * 0.46)), 0, 0, 360, 255, -1)
+        try:
+            dst = cv2.seamlessClone(patch, dst, mask, (cx, cy), cv2.NORMAL_CLONE)
+        except cv2.error as exc:
+            logger.warning("seamlessClone не удался для лица (%s,%s): %s", fx, fy, exc)
+
+    ok, encoded = cv2.imencode(".jpg", dst, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ok:
+        raise ValueError("encode failed")
+    return encoded.tobytes()
 
 
 def _largest_photo_url(photo) -> str | None:
@@ -1594,6 +1680,7 @@ async def handle_help_command(message: Message) -> None:
         "• Стата — статистика беседы\n"
         "• !онлайн — кто сейчас в сети\n"
         "• !дем <текст> + фото — сделать демотиватор\n"
+        "• !пс + 2 фото — наложить лицо с первого фото на второе\n"
         "• !н — администратор бота",
     )
 
@@ -1680,6 +1767,52 @@ async def handle_dem_command(message: Message, raw_arg: str) -> None:
     except Exception as exc:
         logger.error("Не удалось сделать демотиватор в peer %s: %s", peer_id, exc)
         await send_text(peer_id, "😔 Не получилось сделать демотиватор, попробуй другое фото.")
+
+
+def _collect_photos(message: Message) -> list:
+    photos = []
+    for source in (message, getattr(message, "reply_message", None)):
+        if source is None:
+            continue
+        for att in (getattr(source, "attachments", None) or []):
+            att_type = getattr(att.type, "value", None) or str(att.type)
+            if att_type == "photo" and att.photo is not None:
+                photos.append(att.photo)
+    return photos
+
+
+async def handle_faceswap_command(message: Message) -> None:
+    peer_id = message.peer_id
+    photos = _collect_photos(message)
+    if len(photos) < 2:
+        await send_text(
+            peer_id,
+            "🎭 Наложение лица:\n"
+            "1. Прикрепи 2 фото к команде !пс: первое — чье лицо, второе — куда наложить\n"
+            "2. Или ответь командой !пс + фото с лицом на сообщение с фото-целью",
+        )
+        return
+
+    face_url = _largest_photo_url(photos[0])
+    target_url = _largest_photo_url(photos[1])
+    if not face_url or not target_url:
+        await send_text(peer_id, "😔 Не смог достать фото, попробуй другие.")
+        return
+
+    try:
+        face_bytes = await _download(face_url)
+        target_bytes = await _download(target_url)
+        result = await asyncio.to_thread(face_swap, face_bytes, target_bytes)
+        attachment = await _photo_uploader.upload(result, peer_id=peer_id)
+        await bot.api.messages.send(
+            peer_id=peer_id, random_id=random.randint(1, 2_147_483_647),
+            attachment=attachment,
+        )
+    except LookupError:
+        await send_text(peer_id, "🙈 Не нашел лицо на одном из фото. Нужны фото, где лицо видно анфас.")
+    except Exception as exc:
+        logger.error("Не удалось наложить лицо в peer %s: %s", peer_id, exc)
+        await send_text(peer_id, "😔 Не получилось, попробуй другие фото.")
 
 
 async def handle_admin_info_command(message: Message) -> None:
@@ -1777,6 +1910,9 @@ async def moderate_message(message: Message) -> None:
         return
     if command in {"!дем", "!dem"}:
         await handle_dem_command(message, command_arg)
+        return
+    if command in {"!пс", "!ps"}:
+        await handle_faceswap_command(message)
         return
     # «Кто я» и синонимы — анкета вызвавшего (или того, на кого ответили).
     # Срабатывает только если сообщение состоит из одной команды, чтобы

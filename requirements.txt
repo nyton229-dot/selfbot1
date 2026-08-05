@@ -1,3 +1,4 @@
 vkbottle>=4.10
 python-dotenv
 pillow
+opencv-python-headless
