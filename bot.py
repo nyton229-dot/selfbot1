@@ -25,7 +25,12 @@ import time
 
 from dotenv import load_dotenv
 from vkbottle import (
+    Callback,
     DocMessagesUploader,
+    GroupEventType,
+    GroupTypes,
+    Keyboard,
+    KeyboardButtonColor,
     PhotoMessageUploader,
     VKAPIError,
     VoiceMessageUploader,
@@ -381,6 +386,89 @@ def format_duration(sec: float) -> str:
     if sec >= 60:
         return f"{sec // 60} мин"
     return f"{sec} сек"
+
+
+# --- Крестики-нолики (!км) ----------------------------------------------------
+
+TTT_TTL_SEC = 30 * 60
+TTT_WIN_LINES = [
+    (0, 1, 2), (3, 4, 5), (6, 7, 8),
+    (0, 3, 6), (1, 4, 7), (2, 5, 8),
+    (0, 4, 8), (2, 4, 6),
+]
+# Игры живут в памяти: {game_id: состояние}. Старые чистятся лениво.
+_ttt_games: dict[str, dict] = {}
+
+
+def _ttt_cleanup() -> None:
+    now = time.monotonic()
+    for gid in [g for g, game in _ttt_games.items() if now - game["created"] > TTT_TTL_SEC]:
+        del _ttt_games[gid]
+
+
+def _ttt_new_game(peer_id: int, x_id: int, target_id: int | None) -> str:
+    _ttt_cleanup()
+    gid = f"{random.randrange(16 ** 8):08x}"
+    _ttt_games[gid] = {
+        "peer": peer_id,
+        "x": x_id,
+        "o": None,
+        "target": target_id,
+        "board": [""] * 9,
+        "turn": "x",
+        "created": time.monotonic(),
+        "finished": False,
+    }
+    return gid
+
+
+def _ttt_winner(board: list[str]) -> str | None:
+    for a, b, c in TTT_WIN_LINES:
+        if board[a] and board[a] == board[b] == board[c]:
+            return board[a]
+    if all(board):
+        return "draw"
+    return None
+
+
+def _ttt_join_keyboard(gid: str) -> str:
+    kb = Keyboard(inline=True)
+    kb.add(Callback("⚔️ Принять вызов", {"km": "join", "g": gid}), color=KeyboardButtonColor.POSITIVE)
+    return kb.get_json()
+
+
+def _ttt_board_keyboard(gid: str, game: dict) -> str:
+    kb = Keyboard(inline=True)
+    for row in range(3):
+        if row:
+            kb.row()
+        for col in range(3):
+            i = row * 3 + col
+            mark = game["board"][i]
+            if mark == "x":
+                label, color = "❌", KeyboardButtonColor.NEGATIVE
+            elif mark == "o":
+                label, color = "⭕", KeyboardButtonColor.PRIMARY
+            else:
+                label, color = "·", KeyboardButtonColor.SECONDARY
+            kb.add(Callback(label, {"km": "move", "g": gid, "c": i}), color=color)
+    return kb.get_json()
+
+
+async def _ttt_text(game: dict, status_line: str) -> str:
+    x_link = await _target_link(game["peer"], game["x"])
+    o_link = await _target_link(game["peer"], game["o"]) if game["o"] else "?"
+    return f"⭕❌ Крестики-нолики\n❌ {x_link} vs ⭕ {o_link}\n{status_line}"
+
+
+async def _ttt_edit(peer_id: int, cmid: int, text: str, keyboard: str) -> None:
+    try:
+        await bot.api.messages.edit(
+            peer_id=peer_id, cmid=cmid, message=text,
+            keyboard=keyboard, disable_mentions=True,
+        )
+    except VKAPIError as exc:
+        logger.warning("Не удалось обновить поле игры в peer %s: %s", peer_id, exc)
 
 
 # --- Проверка прав администратора беседы -----------------------------------
@@ -937,6 +1025,148 @@ async def handle_stats_command(message: Message) -> None:
     await send_text(peer_id, "\n".join(lines))
 
 
+async def handle_ttt_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    arg = raw_arg.strip()
+    lowered = arg.lower()
+
+    if not lowered or lowered in {"помощь", "help"}:
+        await send_text(
+            peer_id,
+            "⭕❌ Крестики-нолики:\n"
+            "!км вызов — вызов всей беседе (кто первым нажмет кнопку, играет за ⭕)\n"
+            "!км вызов (реплеем или со ссылкой) — вызвать конкретного игрока",
+        )
+        return
+
+    if not lowered.startswith("вызов"):
+        await send_text(peer_id, "🤔 Не понял. Напиши: !км вызов")
+        return
+
+    target_id, _ = await extract_target(message, arg[len("вызов"):].strip())
+    if target_id == message.from_id:
+        await send_text(peer_id, "🙃 Нельзя вызвать самого себя.")
+        return
+
+    gid = _ttt_new_game(peer_id, message.from_id, target_id)
+    challenger = await _target_link(peer_id, message.from_id)
+    if target_id:
+        opponent = await _target_link(peer_id, target_id)
+        text = (
+            f"⚔️ {challenger} вызывает {opponent} сыграть в крестики-нолики!\n"
+            f"Принять вызов может только {opponent}."
+        )
+    else:
+        text = (
+            f"⚔️ {challenger} вызывает беседу сыграть в крестики-нолики!\n"
+            "Кто первым нажмет кнопку — играет за ⭕."
+        )
+    try:
+        await bot.api.messages.send(
+            peer_id=peer_id, message=text, random_id=random.randint(1, 2**31 - 1),
+            keyboard=_ttt_join_keyboard(gid), disable_mentions=True,
+        )
+    except VKAPIError as exc:
+        _ttt_games.pop(gid, None)
+        logger.error("Не удалось отправить вызов в peer %s: %s", peer_id, exc)
+
+
+async def _ttt_handle_event(obj, payload: dict, action: str) -> str | None:
+    """Обрабатывает нажатие кнопки. Возвращает текст для снекбара или None."""
+    gid = payload.get("g")
+    game = _ttt_games.get(gid)
+    if game is None or game["finished"]:
+        return "Игра уже завершена или устарела."
+
+    user_id = obj.user_id
+    peer_id = obj.peer_id
+
+    if action == "join":
+        if game["o"] is not None:
+            return "Игра уже началась."
+        if user_id == game["x"]:
+            return "Нельзя играть с самим собой 🙂"
+        if game["target"] and user_id != game["target"]:
+            return "Этот вызов адресован другому игроку."
+        game["o"] = user_id
+        status = f"Ход: ❌ {await _target_link(peer_id, game['x'])}"
+        await _ttt_edit(
+            peer_id, obj.conversation_message_id,
+            await _ttt_text(game, status), _ttt_board_keyboard(gid, game),
+        )
+        return None
+
+    if action == "move":
+        if game["o"] is None:
+            return "Игра еще не началась — сначала кто-то должен принять вызов."
+        if user_id not in (game["x"], game["o"]):
+            return "Ты не участвуешь в этой игре."
+        mark = "x" if user_id == game["x"] else "o"
+        if game["turn"] != mark:
+            return "Сейчас не твой ход."
+        cell = payload.get("c")
+        if not isinstance(cell, int) or not 0 <= cell < 9 or game["board"][cell]:
+            return "Эта клетка занята."
+
+        game["board"][cell] = mark
+        winner = _ttt_winner(game["board"])
+        if winner == "draw":
+            game["finished"] = True
+            status = "🤝 Ничья!"
+        elif winner:
+            game["finished"] = True
+            win_id = game["x"] if winner == "x" else game["o"]
+            emoji = "❌" if winner == "x" else "⭕"
+            status = f"🏆 Победил {emoji} {await _target_link(peer_id, win_id)}!"
+        else:
+            game["turn"] = "o" if mark == "x" else "x"
+            next_id = game["x"] if game["turn"] == "x" else game["o"]
+            emoji = "❌" if game["turn"] == "x" else "⭕"
+            status = f"Ход: {emoji} {await _target_link(peer_id, next_id)}"
+
+        await _ttt_edit(
+            peer_id, obj.conversation_message_id,
+            await _ttt_text(game, status), _ttt_board_keyboard(gid, game),
+        )
+        if game["finished"]:
+            _ttt_games.pop(gid, None)
+        return None
+
+    return None
+
+
+@bot.on.raw_event(GroupEventType.MESSAGE_EVENT, dataclass=GroupTypes.MessageEvent)
+async def on_message_event(event: GroupTypes.MessageEvent) -> None:
+    obj = event.object
+    payload = obj.payload
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    snackbar = None
+    action = payload.get("km")
+    if action:
+        try:
+            snackbar = await _ttt_handle_event(obj, payload, action)
+        except Exception as exc:
+            logger.error("Ошибка обработки кнопки: %s", exc)
+
+    event_data = None
+    if snackbar:
+        event_data = json.dumps({"type": "show_snackbar", "text": snackbar}, ensure_ascii=False)
+    try:
+        await bot.api.messages.send_message_event_answer(
+            event_id=obj.event_id, user_id=obj.user_id,
+            peer_id=obj.peer_id, event_data=event_data,
+        )
+    except VKAPIError as exc:
+        logger.warning("Не удалось ответить на нажатие кнопки: %s", exc)
+
+
 async def handle_admin_info_command(message: Message) -> None:
     """!н — показать, кто администратор бота, со ссылкой для связи."""
     lines = []
@@ -1001,6 +1231,9 @@ async def moderate_message(message: Message) -> None:
         return
     if command in {"!стата", "!статистика", "!stats"} and not command_arg:
         await handle_stats_command(message)
+        return
+    if command in {"!км", "!km"}:
+        await handle_ttt_command(message, command_arg)
         return
     # «Кто я» и синонимы — анкета вызвавшего (или того, на кого ответили).
     # Срабатывает только если сообщение состоит из одной команды, чтобы
