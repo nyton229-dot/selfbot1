@@ -384,6 +384,49 @@ def reset_warns(peer_id: int, user_id: int) -> None:
         _save_stats(force=True)
 
 
+# --- Черный список (бан) -------------------------------------------------------
+
+BANS_PATH = os.path.join(DATA_DIR, "bans.json")
+
+
+def _load_bans() -> dict[str, dict]:
+    try:
+        with open(BANS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Не удалось прочитать %s: %s", BANS_PATH, exc)
+        return {}
+
+
+_bans: dict[str, dict] = _load_bans()
+
+
+def _save_bans() -> None:
+    try:
+        _save_json(BANS_PATH, _bans)
+    except Exception as exc:
+        logger.error("Не удалось сохранить %s: %s", BANS_PATH, exc)
+
+
+def is_banned(peer_id: int, user_id: int) -> bool:
+    return _nick_key(peer_id, user_id) in _bans
+
+
+def add_ban(peer_id: int, user_id: int, by_id: int) -> None:
+    _bans[_nick_key(peer_id, user_id)] = {"by": by_id, "ts": time.time()}
+    _save_bans()
+
+
+def remove_ban(peer_id: int, user_id: int) -> bool:
+    if _bans.pop(_nick_key(peer_id, user_id), None) is not None:
+        _save_bans()
+        return True
+    return False
+
+
 # --- Мут (!мут / !размут) ----------------------------------------------------
 
 MUTES_PATH = os.path.join(DATA_DIR, "mutes.json")
@@ -1230,6 +1273,84 @@ async def handle_warn_command(message: Message, raw_arg: str) -> None:
         )
 
 
+async def _resolve_punish_target(message: Message, raw_arg: str, verb: str) -> int | None:
+    """Общий разбор цели для кик/бан: права, реплей/ссылка, защита владельца."""
+    peer_id = message.peer_id
+    target_id, _ = await extract_target(message, raw_arg.strip())
+    if target_id is None:
+        # Голое слово без реплея и ссылки — молчим, чтобы не спамить на обычные фразы.
+        if raw_arg.strip() or getattr(message, "reply_message", None) is not None:
+            await send_text(
+                peer_id,
+                f"🤔 Кого {verb}? Ответь командой реплеем на сообщение или добавь ссылку.",
+            )
+        return None
+    if not await can_manage_bot(peer_id, message.from_id):
+        await send_text(peer_id, f"⛔ {verb.capitalize()} может только админ.")
+        return None
+    if target_id in BOT_OWNER_IDS:
+        await send_text(peer_id, "😎 Главного админа бота нельзя тронуть.")
+        return None
+    if target_id == message.from_id:
+        await send_text(peer_id, "🙃 Себя нельзя.")
+        return None
+    return target_id
+
+
+async def handle_kick_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    target_id = await _resolve_punish_target(message, raw_arg, "кикнуть")
+    if target_id is None:
+        return
+    link = await _target_link(peer_id, target_id)
+    if await kick_user(peer_id, target_id):
+        await send_text(peer_id, f"👢 {link} исключен из беседы.")
+    else:
+        await send_text(
+            peer_id,
+            f"😔 Не смог кикнуть {link} — нужны права администратора беседы "
+            "(и админов ВК кикать не дает).",
+        )
+
+
+async def handle_ban_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    target_id = await _resolve_punish_target(message, raw_arg, "забанить")
+    if target_id is None:
+        return
+    link = await _target_link(peer_id, target_id)
+    add_ban(peer_id, target_id, message.from_id)
+    kicked = await kick_user(peer_id, target_id)
+    if kicked:
+        await send_text(
+            peer_id,
+            f"🚫 {link} забанен и исключен из беседы.\n"
+            "Если вернется — кикну автоматически. Снять: разбан (реплеем/ссылкой)",
+        )
+    else:
+        await send_text(
+            peer_id,
+            f"🚫 {link} занесен в черный список, но кикнуть не смог — "
+            "нужны права администратора беседы.",
+        )
+
+
+async def handle_unban_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    if not await can_manage_bot(peer_id, message.from_id):
+        await send_text(peer_id, "⛔ Разбанить может только админ.")
+        return
+    target_id, _ = await extract_target(message, raw_arg.strip())
+    if target_id is None:
+        await send_text(peer_id, "🤔 Кого разбанить? Ответь реплеем или добавь ссылку.")
+        return
+    link = await _target_link(peer_id, target_id)
+    if remove_ban(peer_id, target_id):
+        await send_text(peer_id, f"✅ {link} разбанен, может возвращаться.")
+    else:
+        await send_text(peer_id, f"ℹ️ {link} не в черном списке.")
+
+
 async def handle_mute_command(message: Message, raw_arg: str) -> None:
     peer_id = message.peer_id
     if not await can_manage_bot(peer_id, message.from_id):
@@ -1610,6 +1731,18 @@ async def handle_chat_action(message: Message) -> None:
     if not isinstance(new_id, int) or new_id <= 0:
         return
 
+    # Забаненный пытается вернуться — кикаем сразу.
+    if is_banned(message.peer_id, new_id):
+        link = await _target_link(message.peer_id, new_id)
+        if await kick_user(message.peer_id, new_id):
+            await send_text(message.peer_id, f"🚫 {link} в черном списке — кикнут автоматически.")
+        else:
+            await send_text(
+                message.peer_id,
+                f"🚫 {link} в черном списке, но кикнуть не смог — нужны права админа беседы.",
+            )
+        return
+
     greeting = get_chat_setting(message.peer_id, "greeting")
     if greeting == "":  # приветствие выключено
         return
@@ -1671,6 +1804,8 @@ async def handle_help_command(message: Message) -> None:
         "\n🛡 Модерация (админ):\n"
         "• !мат <слово> — свое запрещенное слово (!мат удалить, !мат список)\n"
         "• !варн (реплеем/ссылкой) — предупреждение, 3/3 — кик (!варн снять)\n"
+        "• Кик (реплеем/ссылкой) — исключить из беседы\n"
+        "• Бан / Разбан — исключить и не пускать обратно\n"
         "• !мут 10м / !размут — мут на время\n"
         "• !приветствие <текст> — приветствие новичков\n"
         "\n🎮 Игры:\n"
@@ -1875,6 +2010,15 @@ async def moderate_message(message: Message) -> None:
         return
     if command in {"!варн", "!warn"}:
         await handle_warn_command(message, command_arg)
+        return
+    if command in {"кик", "!кик", "!kick"}:
+        await handle_kick_command(message, command_arg)
+        return
+    if command in {"бан", "!бан", "!ban"}:
+        await handle_ban_command(message, command_arg)
+        return
+    if command in {"разбан", "!разбан", "!unban"}:
+        await handle_unban_command(message, command_arg)
         return
     if command in {"!мут", "!mute"}:
         await handle_mute_command(message, command_arg)
