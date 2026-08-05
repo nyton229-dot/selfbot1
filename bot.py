@@ -278,6 +278,43 @@ def record_violation_stat(peer_id: int, user_id: int) -> None:
     _save_stats(force=True)
 
 
+# --- Монеты (рулетка, бонус) -------------------------------------------------
+
+COINS_START = 500
+BONUS_AMOUNT = 200
+BONUS_COOLDOWN_SEC = 24 * 3600
+
+
+def get_coins(peer_id: int, user_id: int) -> int:
+    entry = _stats.get(_nick_key(peer_id, user_id)) or {}
+    return entry.get("coins", COINS_START)
+
+
+def change_coins(peer_id: int, user_id: int, delta: int) -> int:
+    entry = _stats.setdefault(
+        _nick_key(peer_id, user_id), {"msgs": 0, "viol": 0, "first": time.time()}
+    )
+    entry["coins"] = max(0, entry.get("coins", COINS_START) + delta)
+    _save_stats(force=True)
+    return entry["coins"]
+
+
+def try_claim_bonus(peer_id: int, user_id: int) -> float:
+    """Начисляет ежедневный бонус. Возвращает 0 при успехе, иначе секунды до следующего."""
+    entry = _stats.setdefault(
+        _nick_key(peer_id, user_id), {"msgs": 0, "viol": 0, "first": time.time()}
+    )
+    now = time.time()
+    last = entry.get("bonus_ts", 0)
+    remaining = BONUS_COOLDOWN_SEC - (now - last)
+    if remaining > 0:
+        return remaining
+    entry["bonus_ts"] = now
+    entry["coins"] = entry.get("coins", COINS_START) + BONUS_AMOUNT
+    _save_stats(force=True)
+    return 0
+
+
 # --- Предупреждения (!варн) -------------------------------------------------
 
 WARN_LIMIT = 3
@@ -386,6 +423,30 @@ def format_duration(sec: float) -> str:
     if sec >= 60:
         return f"{sec // 60} мин"
     return f"{sec} сек"
+
+
+# --- Рулетка (!рулетка) --------------------------------------------------------
+
+ROULETTE_TTL_SEC = 10 * 60
+ROULETTE_ZERO_MULT = 14
+# Красные номера настоящей европейской рулетки.
+ROULETTE_RED = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
+_roulette_bets: dict[str, dict] = {}
+
+
+def _roulette_cleanup() -> None:
+    now = time.monotonic()
+    for gid in [g for g, bet in _roulette_bets.items() if now - bet["created"] > ROULETTE_TTL_SEC]:
+        del _roulette_bets[gid]
+
+
+def _roulette_keyboard(gid: str) -> str:
+    kb = Keyboard(inline=True)
+    kb.add(Callback("🔴 Красное x2", {"rl": "spin", "g": gid, "ch": "red"}), color=KeyboardButtonColor.NEGATIVE)
+    kb.add(Callback("⚫ Черное x2", {"rl": "spin", "g": gid, "ch": "black"}), color=KeyboardButtonColor.SECONDARY)
+    kb.row()
+    kb.add(Callback(f"🟢 Зеро x{ROULETTE_ZERO_MULT}", {"rl": "spin", "g": gid, "ch": "zero"}), color=KeyboardButtonColor.POSITIVE)
+    return kb.get_json()
 
 
 # --- Крестики-нолики (!км) ----------------------------------------------------
@@ -852,6 +913,7 @@ async def handle_profile_command(message: Message, target_id: int | None = None)
         f"🆔 Айди: id{target_id}",
         f"🎖 Роль: {role}",
         f"💬 Сообщений: {msgs}",
+        f"💰 Монет: {entry.get('coins', COINS_START)}",
         f"🤬 Удалено за мат: {viol}",
         f"⚠️ Предупреждения: {warns}/{WARN_LIMIT}",
         f"📅 Первое сообщение: {since}",
@@ -1049,7 +1111,144 @@ async def handle_stats_command(message: Message) -> None:
         for i, (uid, e) in enumerate(top_viol, 1):
             lines.append(f"{i}. {await _target_link(peer_id, uid)} — {e.get('viol', 0)}")
 
+    top_rich = sorted(
+        entries.items(), key=lambda kv: kv[1].get("coins", COINS_START), reverse=True
+    )[:5]
+    top_rich = [(uid, e) for uid, e in top_rich if e.get("coins", COINS_START) > 0]
+    if top_rich:
+        lines.append("\n💰 Топ богачей:")
+        for i, (uid, e) in enumerate(top_rich, 1):
+            lines.append(f"{i}. {await _target_link(peer_id, uid)} — {e.get('coins', COINS_START)}")
+
     await send_text(peer_id, "\n".join(lines))
+
+
+async def handle_roulette_command(message: Message, raw_arg: str) -> None:
+    peer_id = message.peer_id
+    user_id = message.from_id
+    arg = raw_arg.strip().lower()
+    balance = get_coins(peer_id, user_id)
+
+    if not arg or arg in {"помощь", "help"}:
+        await send_text(
+            peer_id,
+            "🎰 Рулетка:\n"
+            "!рулетка <ставка> — сделать ставку (например: !рулетка 50)\n"
+            "!рулетка все — поставить всё\n"
+            f"Красное/черное — выигрыш x2, зеро — x{ROULETTE_ZERO_MULT}\n"
+            f"💰 Твой баланс: {balance} монет. Пополнение: !бонус (раз в сутки)",
+        )
+        return
+
+    if arg in {"все", "всё", "all", "олл"}:
+        bet = balance
+    elif arg.isdigit():
+        bet = int(arg)
+    else:
+        await send_text(peer_id, "🤔 Ставка — это число: !рулетка 50 (или: !рулетка все)")
+        return
+
+    if bet <= 0:
+        await send_text(peer_id, "😅 Ставка должна быть больше нуля.")
+        return
+    if bet > balance:
+        await send_text(
+            peer_id,
+            f"💸 Не хватает монет: у тебя {balance}, ставка {bet}.\n"
+            "Забери ежедневный бонус: !бонус",
+        )
+        return
+
+    _roulette_cleanup()
+    gid = f"{random.randrange(16 ** 8):08x}"
+    link = await _target_link(peer_id, user_id)
+    text = (
+        f"🎰 {link} ставит {bet} монет!\n"
+        "Выбирай, на что ставим:"
+    )
+    bet_state = {
+        "peer": peer_id, "user": user_id, "bet": bet,
+        "created": time.monotonic(), "cmid": None,
+    }
+    _roulette_bets[gid] = bet_state
+    bet_state["cmid"] = await _send_with_keyboard(peer_id, text, _roulette_keyboard(gid))
+    if bet_state["cmid"] is None:
+        _roulette_bets.pop(gid, None)
+
+
+async def _roulette_handle_event(obj, payload: dict) -> str | None:
+    gid = payload.get("g")
+    bet_state = _roulette_bets.get(gid)
+    if bet_state is None:
+        return "Ставка устарела, сделай новую: !рулетка <число>"
+    if obj.user_id != bet_state["user"]:
+        return "Это не твоя ставка 🙂"
+
+    choice = payload.get("ch")
+    if choice not in {"red", "black", "zero"}:
+        return None
+
+    peer_id = bet_state["peer"]
+    user_id = bet_state["user"]
+    bet = bet_state["bet"]
+    _roulette_bets.pop(gid, None)
+
+    balance = get_coins(peer_id, user_id)
+    if bet > balance:
+        return f"Не хватает монет: у тебя {balance}, ставка {bet}."
+
+    roll = random.randint(0, 36)
+    if roll == 0:
+        color, color_name = "zero", "🟢 Зеро"
+    elif roll in ROULETTE_RED:
+        color, color_name = "red", "🔴 Красное"
+    else:
+        color, color_name = "black", "⚫ Черное"
+
+    if choice == color:
+        win_mult = ROULETTE_ZERO_MULT if choice == "zero" else 2
+        delta = bet * (win_mult - 1)
+        outcome = f"🎉 Выигрыш {bet * win_mult} монет (x{win_mult})!"
+    else:
+        delta = -bet
+        outcome = f"😢 Ставка {bet} монет сгорела."
+
+    new_balance = change_coins(peer_id, user_id, delta)
+
+    old_cmid = bet_state.get("cmid")
+    if old_cmid:
+        try:
+            await bot.api.messages.delete(peer_id=peer_id, cmids=[old_cmid], delete_for_all=True)
+        except VKAPIError as exc:
+            logger.debug("Не удалось удалить сообщение ставки: %s", exc)
+
+    link = await _target_link(peer_id, user_id)
+    await send_text(
+        peer_id,
+        f"🎰 Выпало: {roll} {color_name}\n{link}: {outcome}\n💰 Баланс: {new_balance} монет",
+    )
+    return None
+
+
+async def handle_balance_command(message: Message) -> None:
+    peer_id = message.peer_id
+    balance = get_coins(peer_id, message.from_id)
+    link = await _target_link(peer_id, message.from_id)
+    await send_text(peer_id, f"💰 {link}, у тебя {balance} монет.\nИграть: !рулетка <ставка>. Бонус: !бонус")
+
+
+async def handle_bonus_command(message: Message) -> None:
+    peer_id = message.peer_id
+    link = await _target_link(peer_id, message.from_id)
+    remaining = try_claim_bonus(peer_id, message.from_id)
+    if remaining > 0:
+        await send_text(
+            peer_id,
+            f"⏳ {link}, бонус уже забран. Следующий через {format_duration(remaining)}.",
+        )
+        return
+    balance = get_coins(peer_id, message.from_id)
+    await send_text(peer_id, f"🎁 {link} получает {BONUS_AMOUNT} монет!\n💰 Баланс: {balance}")
 
 
 async def handle_ttt_command(message: Message, raw_arg: str) -> None:
@@ -1165,12 +1364,13 @@ async def on_message_event(event: GroupTypes.MessageEvent) -> None:
         payload = {}
 
     snackbar = None
-    action = payload.get("km")
-    if action:
-        try:
-            snackbar = await _ttt_handle_event(obj, payload, action)
-        except Exception as exc:
-            logger.error("Ошибка обработки кнопки: %s", exc)
+    try:
+        if payload.get("km"):
+            snackbar = await _ttt_handle_event(obj, payload, payload["km"])
+        elif payload.get("rl"):
+            snackbar = await _roulette_handle_event(obj, payload)
+    except Exception as exc:
+        logger.error("Ошибка обработки кнопки: %s", exc)
 
     event_data = None
     if snackbar:
@@ -1251,6 +1451,15 @@ async def moderate_message(message: Message) -> None:
         return
     if command in {"!км", "!km"}:
         await handle_ttt_command(message, command_arg)
+        return
+    if command in {"!рулетка", "!казино", "!roulette"}:
+        await handle_roulette_command(message, command_arg)
+        return
+    if command in {"!баланс", "!balance"} or (command == "баланс" and not command_arg):
+        await handle_balance_command(message)
+        return
+    if command in {"!бонус", "!bonus"} or (command == "бонус" and not command_arg):
+        await handle_bonus_command(message)
         return
     # «Кто я» и синонимы — анкета вызвавшего (или того, на кого ответили).
     # Срабатывает только если сообщение состоит из одной команды, чтобы
