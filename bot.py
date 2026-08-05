@@ -461,14 +461,41 @@ async def _ttt_text(game: dict, status_line: str) -> str:
     return f"⭕❌ Крестики-нолики\n❌ {x_link} vs ⭕ {o_link}\n{status_line}"
 
 
-async def _ttt_edit(peer_id: int, cmid: int, text: str, keyboard: str) -> None:
+async def _send_with_keyboard(peer_id: int, text: str, keyboard: str) -> int | None:
+    """Шлет сообщение с клавиатурой и возвращает его conversation_message_id.
+
+    Используем messages.send с peer_ids: только в этом варианте VK возвращает
+    conversation_message_id, который нужен, чтобы потом удалить сообщение.
+    """
     try:
-        await bot.api.messages.edit(
-            peer_id=peer_id, cmid=cmid, message=text,
-            keyboard=keyboard, disable_mentions=True,
-        )
+        resp = await bot.api.request("messages.send", {
+            "peer_ids": peer_id,
+            "message": text,
+            "random_id": random.randint(1, 2_147_483_647),
+            "keyboard": keyboard,
+            "disable_mentions": 1,
+        })
     except VKAPIError as exc:
-        logger.warning("Не удалось обновить поле игры в peer %s: %s", peer_id, exc)
+        logger.error("Не удалось отправить сообщение игры в peer %s: %s", peer_id, exc)
+        return None
+    items = resp.get("response") or []
+    if isinstance(items, list) and items:
+        return items[0].get("conversation_message_id")
+    return None
+
+
+async def _ttt_send_board(game: dict, gid: str, text: str, keyboard: str) -> None:
+    """Удаляет старое сообщение игры и шлет новое, чтобы поле всегда было внизу чата."""
+    peer_id = game["peer"]
+    old_cmid = game.get("cmid")
+    if old_cmid:
+        try:
+            await bot.api.messages.delete(
+                peer_id=peer_id, cmids=[old_cmid], delete_for_all=True
+            )
+        except VKAPIError as exc:
+            logger.debug("Не удалось удалить старое поле игры: %s", exc)
+    game["cmid"] = await _send_with_keyboard(peer_id, text, keyboard)
 
 
 # --- Проверка прав администратора беседы -----------------------------------
@@ -1049,6 +1076,7 @@ async def handle_ttt_command(message: Message, raw_arg: str) -> None:
         return
 
     gid = _ttt_new_game(peer_id, message.from_id, target_id)
+    game = _ttt_games[gid]
     challenger = await _target_link(peer_id, message.from_id)
     if target_id:
         opponent = await _target_link(peer_id, target_id)
@@ -1061,14 +1089,9 @@ async def handle_ttt_command(message: Message, raw_arg: str) -> None:
             f"⚔️ {challenger} вызывает беседу сыграть в крестики-нолики!\n"
             "Кто первым нажмет кнопку — играет за ⭕."
         )
-    try:
-        await bot.api.messages.send(
-            peer_id=peer_id, message=text, random_id=random.randint(1, 2**31 - 1),
-            keyboard=_ttt_join_keyboard(gid), disable_mentions=True,
-        )
-    except VKAPIError as exc:
+    await _ttt_send_board(game, gid, text, _ttt_join_keyboard(gid))
+    if game.get("cmid") is None:
         _ttt_games.pop(gid, None)
-        logger.error("Не удалось отправить вызов в peer %s: %s", peer_id, exc)
 
 
 async def _ttt_handle_event(obj, payload: dict, action: str) -> str | None:
@@ -1090,10 +1113,7 @@ async def _ttt_handle_event(obj, payload: dict, action: str) -> str | None:
             return "Этот вызов адресован другому игроку."
         game["o"] = user_id
         status = f"Ход: ❌ {await _target_link(peer_id, game['x'])}"
-        await _ttt_edit(
-            peer_id, obj.conversation_message_id,
-            await _ttt_text(game, status), _ttt_board_keyboard(gid, game),
-        )
+        await _ttt_send_board(game, gid, await _ttt_text(game, status), _ttt_board_keyboard(gid, game))
         return None
 
     if action == "move":
@@ -1124,10 +1144,7 @@ async def _ttt_handle_event(obj, payload: dict, action: str) -> str | None:
             emoji = "❌" if game["turn"] == "x" else "⭕"
             status = f"Ход: {emoji} {await _target_link(peer_id, next_id)}"
 
-        await _ttt_edit(
-            peer_id, obj.conversation_message_id,
-            await _ttt_text(game, status), _ttt_board_keyboard(gid, game),
-        )
+        await _ttt_send_board(game, gid, await _ttt_text(game, status), _ttt_board_keyboard(gid, game))
         if game["finished"]:
             _ttt_games.pop(gid, None)
         return None
