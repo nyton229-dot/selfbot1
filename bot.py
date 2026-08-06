@@ -1566,6 +1566,42 @@ async def _roulette_handle_event(obj, payload: dict) -> str | None:
     return None
 
 
+async def handle_give_coins_command(message: Message, raw_arg: str) -> None:
+    """!выдать <сумма> [реплей/ссылка] — только главный админ бота."""
+    peer_id = message.peer_id
+    if message.from_id not in BOT_OWNER_IDS:
+        await send_text(peer_id, "⛔ Выдавать монеты может только главный админ бота.")
+        return
+
+    target_id, rest = await extract_target(message, raw_arg.strip())
+    if target_id is None:
+        target_id = message.from_id
+
+    amount = None
+    for token in rest.replace("-", " -").split():
+        try:
+            amount = int(token)
+            break
+        except ValueError:
+            continue
+    if amount is None or amount == 0:
+        await send_text(
+            peer_id,
+            "💸 Как выдать: !выдать <сумма> — себе,\n"
+            "!выдать <сумма> реплеем или со ссылкой — другому.\n"
+            "Отрицательная сумма забирает монеты.",
+        )
+        return
+
+    balance = change_coins(peer_id, target_id, amount)
+    link = await _target_link(peer_id, target_id)
+    verb = "получает" if amount > 0 else "теряет"
+    await send_text(
+        peer_id,
+        f"🏦 {link} {verb} {abs(amount):,} монет.\n💰 Баланс: {balance:,}".replace(",", " "),
+    )
+
+
 async def handle_balance_command(message: Message) -> None:
     peer_id = message.peer_id
     balance = get_coins(peer_id, message.from_id)
@@ -2040,6 +2076,9 @@ async def moderate_message(message: Message) -> None:
         return
     if command in {"!бонус", "!bonus"} or (command == "бонус" and not command_arg):
         await handle_bonus_command(message)
+        return
+    if command in {"!выдать", "!give"}:
+        await handle_give_coins_command(message, command_arg)
         return
     if command in {"!приветствие", "!greeting"}:
         await handle_greeting_command(message, command_arg)
