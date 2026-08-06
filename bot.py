@@ -328,33 +328,70 @@ BONUS_AMOUNT = 200
 BONUS_COOLDOWN_SEC = 24 * 3600
 
 
-def get_coins(peer_id: int, user_id: int) -> int:
-    entry = _stats.get(_nick_key(peer_id, user_id)) or {}
-    return entry.get("coins", COINS_START)
+# Кошельки общие для всех бесед: {"user_id": {"coins": ..., "bonus_ts": ...}}.
+WALLETS_PATH = os.path.join(DATA_DIR, "wallets.json")
 
 
-def change_coins(peer_id: int, user_id: int, delta: int) -> int:
-    entry = _stats.setdefault(
-        _nick_key(peer_id, user_id), {"msgs": 0, "viol": 0, "first": time.time()}
-    )
-    entry["coins"] = max(0, entry.get("coins", COINS_START) + delta)
-    _save_stats(force=True)
-    return entry["coins"]
+def _load_wallets() -> dict[str, dict]:
+    try:
+        with open(WALLETS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Не удалось прочитать %s: %s", WALLETS_PATH, exc)
+        return {}
 
 
-def try_claim_bonus(peer_id: int, user_id: int) -> float:
+_wallets: dict[str, dict] = _load_wallets()
+
+
+def _save_wallets() -> None:
+    try:
+        _save_json(WALLETS_PATH, _wallets)
+    except Exception as exc:
+        logger.error("Не удалось сохранить %s: %s", WALLETS_PATH, exc)
+
+
+# Миграция со старой схемы (монеты лежали в статистике по каждой беседе):
+# берем лучший баланс пользователя среди всех бесед.
+if not _wallets:
+    for _key, _entry in _stats.items():
+        if "coins" not in _entry and "bonus_ts" not in _entry:
+            continue
+        _uid = _key.split(":", 1)[1] if ":" in _key else _key
+        _wallet = _wallets.setdefault(_uid, {})
+        if "coins" in _entry:
+            _wallet["coins"] = max(_wallet.get("coins", 0), _entry["coins"])
+        if _entry.get("bonus_ts"):
+            _wallet["bonus_ts"] = max(_wallet.get("bonus_ts", 0), _entry["bonus_ts"])
+    if _wallets:
+        _save_wallets()
+        logger.info("Перенес монеты в общий кошелек: %s пользователей", len(_wallets))
+
+
+def get_coins(user_id: int) -> int:
+    return (_wallets.get(str(user_id)) or {}).get("coins", COINS_START)
+
+
+def change_coins(user_id: int, delta: int) -> int:
+    wallet = _wallets.setdefault(str(user_id), {})
+    wallet["coins"] = max(0, wallet.get("coins", COINS_START) + delta)
+    _save_wallets()
+    return wallet["coins"]
+
+
+def try_claim_bonus(user_id: int) -> float:
     """Начисляет ежедневный бонус. Возвращает 0 при успехе, иначе секунды до следующего."""
-    entry = _stats.setdefault(
-        _nick_key(peer_id, user_id), {"msgs": 0, "viol": 0, "first": time.time()}
-    )
+    wallet = _wallets.setdefault(str(user_id), {})
     now = time.time()
-    last = entry.get("bonus_ts", 0)
-    remaining = BONUS_COOLDOWN_SEC - (now - last)
+    remaining = BONUS_COOLDOWN_SEC - (now - wallet.get("bonus_ts", 0))
     if remaining > 0:
         return remaining
-    entry["bonus_ts"] = now
-    entry["coins"] = entry.get("coins", COINS_START) + BONUS_AMOUNT
-    _save_stats(force=True)
+    wallet["bonus_ts"] = now
+    wallet["coins"] = wallet.get("coins", COINS_START) + BONUS_AMOUNT
+    _save_wallets()
     return 0
 
 
@@ -1171,7 +1208,7 @@ async def handle_profile_command(message: Message, target_id: int | None = None)
         f"🆔 Айди: id{target_id}",
         f"🎖 Роль: {role}",
         f"💬 Сообщений: {msgs}",
-        f"💰 Монет: {entry.get('coins', COINS_START)}",
+        f"💰 Монет: {get_coins(target_id)}",
         f"🤬 Удалено за мат: {viol}",
         f"⚠️ Предупреждения: {warns}/{WARN_LIMIT}",
         f"📅 Первое сообщение: {since}",
@@ -1447,14 +1484,12 @@ async def handle_stats_command(message: Message) -> None:
         for i, (uid, e) in enumerate(top_viol, 1):
             lines.append(f"{i}. {await _target_link(peer_id, uid)} — {e.get('viol', 0)}")
 
-    top_rich = sorted(
-        entries.items(), key=lambda kv: kv[1].get("coins", COINS_START), reverse=True
-    )[:5]
-    top_rich = [(uid, e) for uid, e in top_rich if e.get("coins", COINS_START) > 0]
+    top_rich = sorted(entries, key=get_coins, reverse=True)[:5]
+    top_rich = [uid for uid in top_rich if get_coins(uid) > 0]
     if top_rich:
         lines.append("\n💰 Топ богачей:")
-        for i, (uid, e) in enumerate(top_rich, 1):
-            lines.append(f"{i}. {await _target_link(peer_id, uid)} — {e.get('coins', COINS_START)}")
+        for i, uid in enumerate(top_rich, 1):
+            lines.append(f"{i}. {await _target_link(peer_id, uid)} — {get_coins(uid)}")
 
     await send_text(peer_id, "\n".join(lines))
 
@@ -1463,7 +1498,7 @@ async def handle_roulette_command(message: Message, raw_arg: str) -> None:
     peer_id = message.peer_id
     user_id = message.from_id
     arg = raw_arg.strip().lower()
-    balance = get_coins(peer_id, user_id)
+    balance = get_coins(user_id)
 
     if not arg or arg in {"помощь", "help"}:
         await send_text(
@@ -1529,7 +1564,7 @@ async def _roulette_handle_event(obj, payload: dict) -> str | None:
     bet = bet_state["bet"]
     _roulette_bets.pop(gid, None)
 
-    balance = get_coins(peer_id, user_id)
+    balance = get_coins(user_id)
     if bet > balance:
         return f"Не хватает монет: у тебя {balance}, ставка {bet}."
 
@@ -1549,7 +1584,7 @@ async def _roulette_handle_event(obj, payload: dict) -> str | None:
         delta = -bet
         outcome = f"😢 Ставка {bet} монет сгорела."
 
-    new_balance = change_coins(peer_id, user_id, delta)
+    new_balance = change_coins(user_id, delta)
 
     old_cmid = bet_state.get("cmid")
     if old_cmid:
@@ -1593,7 +1628,7 @@ async def handle_give_coins_command(message: Message, raw_arg: str) -> None:
         )
         return
 
-    balance = change_coins(peer_id, target_id, amount)
+    balance = change_coins(target_id, amount)
     link = await _target_link(peer_id, target_id)
     verb = "получает" if amount > 0 else "теряет"
     await send_text(
@@ -1604,7 +1639,7 @@ async def handle_give_coins_command(message: Message, raw_arg: str) -> None:
 
 async def handle_balance_command(message: Message) -> None:
     peer_id = message.peer_id
-    balance = get_coins(peer_id, message.from_id)
+    balance = get_coins(message.from_id)
     link = await _target_link(peer_id, message.from_id)
     await send_text(peer_id, f"💰 {link}, у тебя {balance} монет.\nИграть: !рулетка <ставка>. Бонус: !бонус")
 
@@ -1612,14 +1647,14 @@ async def handle_balance_command(message: Message) -> None:
 async def handle_bonus_command(message: Message) -> None:
     peer_id = message.peer_id
     link = await _target_link(peer_id, message.from_id)
-    remaining = try_claim_bonus(peer_id, message.from_id)
+    remaining = try_claim_bonus(message.from_id)
     if remaining > 0:
         await send_text(
             peer_id,
             f"⏳ {link}, бонус уже забран. Следующий через {format_duration(remaining)}.",
         )
         return
-    balance = get_coins(peer_id, message.from_id)
+    balance = get_coins(message.from_id)
     await send_text(peer_id, f"🎁 {link} получает {BONUS_AMOUNT} монет!\n💰 Баланс: {balance}")
 
 
