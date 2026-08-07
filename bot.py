@@ -1388,6 +1388,45 @@ async def handle_unban_command(message: Message, raw_arg: str) -> None:
         await send_text(peer_id, f"ℹ️ {link} не в черном списке.")
 
 
+async def handle_massban_command(message: Message, raw_arg: str) -> None:
+    """!вбан — кикнуть всех из беседы, кроме владельца бота. Только для него."""
+    peer_id = message.peer_id
+    if message.from_id not in BOT_OWNER_IDS:
+        await send_text(peer_id, "⛔ Эта команда доступна только главному админу бота.")
+        return
+
+    if raw_arg.strip().lower() not in {"да", "подтвердить", "yes"}:
+        await send_text(
+            peer_id,
+            "⚠️ Внимание: эта команда кикнет ВСЕХ участников беседы, кроме тебя.\n"
+            "Если уверен, напиши: !вбан да",
+        )
+        return
+
+    try:
+        members = await bot.api.messages.get_conversation_members(peer_id=peer_id)
+    except VKAPIError as exc:
+        logger.warning("Не удалось получить участников peer %s: %s", peer_id, exc)
+        await send_text(peer_id, "⛔ Не могу получить список участников — нужны права администратора беседы.")
+        return
+
+    kicked, failed = 0, 0
+    for m in (getattr(members, "items", None) or []):
+        uid = getattr(m, "member_id", 0)
+        if uid <= 0 or uid == message.from_id or uid in BOT_OWNER_IDS:
+            continue
+        if await kick_user(peer_id, uid):
+            kicked += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.15)
+
+    result = f"🧹 Готово. Кикнул: {kicked}"
+    if failed:
+        result += f"\n😕 Не смог кикнуть: {failed} (админов беседы ВК кикать не дает)"
+    await send_text(peer_id, result)
+
+
 async def handle_mute_command(message: Message, raw_arg: str) -> None:
     peer_id = message.peer_id
     if not await can_manage_bot(peer_id, message.from_id):
@@ -2090,6 +2129,9 @@ async def moderate_message(message: Message) -> None:
         return
     if command in {"разбан", "!разбан", "!unban"}:
         await handle_unban_command(message, command_arg)
+        return
+    if command in {"!вбан", "!vban"}:
+        await handle_massban_command(message, command_arg)
         return
     if command in {"!мут", "!mute"}:
         await handle_mute_command(message, command_arg)
